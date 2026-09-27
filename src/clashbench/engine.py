@@ -45,6 +45,8 @@ class Measurement:
     chatgpt: str | None = None
     youtube: str | None = None
     netflix: str | None = None
+    enrichment_status: str = "not_requested"
+    enrichment_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

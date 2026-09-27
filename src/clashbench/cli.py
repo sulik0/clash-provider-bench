@@ -9,9 +9,14 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .db import add_measurements, begin_run, connect, export_csv, finish_run
+from .db import (
+    add_measurements, begin_provider, begin_run, connect, export_csv, finish_provider,
+    finish_run, rotated_providers,
+)
 from .engine import FaceairAdapter, materialize_provider, parse_faceair_tsv, write_mock_tsv
 from .enrich import MihomoEnricher
+from .environment import capture_network_environment
+from .profile import benchmark_profile
 from .report import since_iso, write_reports
 from .schedule import LABEL, launch_agent
 from .util import load_dotenv, public_config_digest, redact
@@ -28,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
             cmd.add_argument("--mock", action="store_true", help="Store deterministic fixtures; no network or real test")
     report = sub.add_parser("report")
     report.add_argument("--config", default="bench.toml"); report.add_argument("--days", type=int, default=7); report.add_argument("--output", default="reports")
+    report.add_argument("--run-id", help="Regenerate the single-run report for this run and anchor its trend")
     export = sub.add_parser("export")
     export.add_argument("--config", default="bench.toml"); export.add_argument("--days", type=int, default=7); export.add_argument("--output", default="reports/results.csv")
     schedule = sub.add_parser("schedule")
@@ -42,12 +48,28 @@ def cmd_run(args) -> int:
     settings = load_config(config_path)
     regions = [x.strip().upper() for x in args.regions.split(",")] if args.regions else settings.regions
     conn = connect(settings.database)
-    run_id = begin_run(conn, public_config_digest(settings.raw), "mock" if args.mock else "faceair/clash-speedtest", regions)
+    adapter = None if args.mock else FaceairAdapter(settings)
+    if args.mock:
+        engine_version = "mock-v1"
+    else:
+        _, engine_version = adapter.doctor()
+        engine_version = engine_version or "unknown"
+    environment = capture_network_environment()
+    comparison_key, parameters = benchmark_profile(settings, regions, engine_version, environment)
+    provider_names = [provider.name for provider in settings.providers]
+    provider_order = rotated_providers(conn, provider_names, comparison_key)
+    providers_by_name = {provider.name: provider for provider in settings.providers}
+    run_id = begin_run(
+        conn, public_config_digest(settings.raw), "mock" if args.mock else "faceair/clash-speedtest", regions,
+        comparison_key=comparison_key, engine_version=engine_version, parameters=parameters,
+        environment=environment, provider_order=provider_order,
+    )
     runtime = settings.root / ".runtime" / run_id
     errors, total = [], 0
     try:
-        adapter = None if args.mock else FaceairAdapter(settings)
-        for provider in settings.providers:  # intentionally sequential for fair resource use
+        for ordinal, provider_name in enumerate(provider_order):
+            provider = providers_by_name[provider_name]
+            begin_provider(conn, run_id, provider.name, ordinal)
             try:
                 if args.mock:
                     values = parse_faceair_tsv(write_mock_tsv(runtime, provider.name), provider.name, {}, settings.region_patterns)
@@ -56,28 +78,41 @@ def cmd_run(args) -> int:
                     config = materialize_provider(provider, runtime, str(settings.engine.get("user_agent", "mihomo/1.19")))
                     values = adapter.run(provider, config, regions)
                     if settings.enrichment.get("enabled", False):
-                        mihomo_binary = str(settings.enrichment.get("mihomo_binary", "mihomo"))
-                        if "/" in mihomo_binary:
-                            mihomo_binary = str((settings.root / mihomo_binary).resolve())
-                        with MihomoEnricher(mihomo_binary, runtime, config,
-                                            bool(settings.enrichment.get("unlock", False)),
-                                            int(settings.enrichment.get("timeout_seconds", 15))) as enricher:
-                            enricher.enrich(values)
-                total += add_measurements(conn, run_id, values)
+                        try:
+                            mihomo_binary = str(settings.enrichment.get("mihomo_binary", "mihomo"))
+                            if "/" in mihomo_binary:
+                                mihomo_binary = str((settings.root / mihomo_binary).resolve())
+                            with MihomoEnricher(mihomo_binary, runtime, config,
+                                                bool(settings.enrichment.get("unlock", False)),
+                                                int(settings.enrichment.get("timeout_seconds", 15))) as enricher:
+                                enricher.enrich(values)
+                        except Exception as exc:
+                            for item in values:
+                                if item.available:
+                                    item.enrichment_status = "failed"
+                                    item.enrichment_error = type(exc).__name__
+                                else:
+                                    item.enrichment_status = "skipped"
+                            print(f"[{provider.name}] enrichment failed: {type(exc).__name__}", file=sys.stderr)
+                count = add_measurements(conn, run_id, values)
+                total += count
+                finish_provider(conn, run_id, provider.name, "ok", count)
                 print(f"[{provider.name}] stored {len(values)} measurements")
             except Exception as exc:
                 message = redact(exc)
                 errors.append(f"{provider.name}: {message}")
+                finish_provider(conn, run_id, provider.name, "failed", 0, message)
                 print(f"[{provider.name}] failed: {message}", file=sys.stderr)
         status = "partial" if errors and total else "failed" if errors else "ok"
         finish_run(conn, run_id, status, " | ".join(errors) or None)
     finally:
         shutil.rmtree(runtime, ignore_errors=True)
     out_dir = settings.root / settings.report.get("output", "reports")
-    md, html = write_reports(conn, out_dir, int(settings.report.get("days", 7)))
+    reports = write_reports(conn, out_dir, int(settings.report.get("days", 7)), run_id)
     export_csv(conn, out_dir / "results.csv")
     print(f"run={run_id} status={'partial' if errors and total else 'failed' if errors else 'ok'} rows={total}")
-    print(f"report={md}\nhtml={html}")
+    print(f"report={reports['run_md']}\ntrend={reports['trend_html']}")
+    conn.close()
     return 1 if errors and not total else 0
 
 
@@ -97,14 +132,14 @@ def cmd_doctor(args) -> int:
 
 def cmd_report(args) -> int:
     settings = load_config(args.config); conn = connect(settings.database)
-    md, page = write_reports(conn, (settings.root / args.output).resolve(), args.days)
-    print(f"{md}\n{page}"); return 0
+    reports = write_reports(conn, (settings.root / args.output).resolve(), args.days, args.run_id)
+    print(f"{reports['latest_md']}\n{reports['trend_html']}"); conn.close(); return 0
 
 
 def cmd_export(args) -> int:
     settings = load_config(args.config); conn = connect(settings.database)
     count = export_csv(conn, (settings.root / args.output).resolve(), since_iso(args.days))
-    print(f"exported {count} rows"); return 0
+    print(f"exported {count} rows"); conn.close(); return 0
 
 
 def cmd_schedule(args) -> int:

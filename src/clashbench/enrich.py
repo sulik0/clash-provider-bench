@@ -94,7 +94,9 @@ class MihomoEnricher:
     def enrich(self, values: list[Measurement]) -> None:
         for item in values:
             if not item.available:
+                item.enrichment_status = "skipped"
                 continue
+            item.enrichment_status = "pending"
             try:
                 name = urllib.parse.quote("GLOBAL", safe="")
                 self._api("PUT", f"/proxies/{name}", {"name": item.node_name})
@@ -108,13 +110,22 @@ class MihomoEnricher:
                     conn = payload.get("connection") or {}
                     item.asn = str(conn.get("asn") or "") or None
                     item.as_org = conn.get("org") or conn.get("isp")
+                    item.enrichment_status = "ok"
+                else:
+                    item.enrichment_status = "failed"
+                    item.enrichment_error = f"ip lookup HTTP {status}"
                 if self.unlock:
-                    item.chatgpt = self._chatgpt()
-                    item.youtube = self._simple_unlock("https://www.youtube.com/premium")
-                    item.netflix = self._simple_unlock("https://www.netflix.com/title/81215567")
+                    try:
+                        item.chatgpt = self._chatgpt()
+                        item.youtube = self._simple_unlock("https://www.youtube.com/premium")
+                        item.netflix = self._simple_unlock("https://www.netflix.com/title/81215567")
+                    except Exception as exc:
+                        item.enrichment_status = "partial" if item.exit_ip else "failed"
+                        item.enrichment_error = f"unlock: {type(exc).__name__}"
             except Exception as exc:
-                # Enrichment is best-effort and must not invalidate throughput results.
-                item.error = (item.error + "; " if item.error else "") + f"enrichment: {type(exc).__name__}"
+                # Never mutate probe status/error: enrichment is an independent best-effort stage.
+                item.enrichment_status = "failed"
+                item.enrichment_error = type(exc).__name__
 
     def _chatgpt(self) -> str:
         status, raw = self._proxied("https://chatgpt.com/cdn-cgi/trace", 64_000)
