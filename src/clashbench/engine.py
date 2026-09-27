@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import os
@@ -7,6 +8,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -118,17 +120,63 @@ def load_nodes(path: Path) -> dict[str, dict[str, Any]]:
     return {str(node.get("name")): node for node in data.get("proxies", []) if isinstance(node, dict) and node.get("name")}
 
 
+def subscription_format(content: bytes) -> str:
+    """Classify a subscription without returning or logging any credential-bearing content."""
+    if len(content) < 10:
+        return "empty"
+    text = content.decode("utf-8", "replace").lstrip("\ufeff\r\n \t")
+    try:
+        data = yaml.safe_load(text)
+        if isinstance(data, dict) and (isinstance(data.get("proxies"), list) or isinstance(data.get("proxy-providers"), dict)):
+            return "clash-yaml"
+    except yaml.YAMLError:
+        pass
+    if re.match(r"(?i)^(vless|vmess|trojan|ss|ssr|hysteria2?|tuic|anytls)://", text):
+        return "uri-list"
+    try:
+        decoded = base64.b64decode("".join(text.split()), validate=True).decode("utf-8", "replace").lstrip()
+        if re.match(r"(?i)^(vless|vmess|trojan|ss|ssr|hysteria2?|tuic|anytls)://", decoded):
+            return "base64-uri-list"
+    except (ValueError, UnicodeError):
+        pass
+    if text[:64].lower().startswith(("<!doctype html", "<html")):
+        return "html"
+    return "unknown"
+
+
 def materialize_provider(provider: Provider, runtime: Path, user_agent: str) -> Path:
     source = provider_source(provider)
     target = runtime / "configs" / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', provider.name)}.yaml"
     if isinstance(source, Path):
         content = source.read_bytes()
+        detected = subscription_format(content)
     else:
-        request = urllib.request.Request(source, headers={"User-Agent": user_agent})
-        with urllib.request.urlopen(request, timeout=30, context=ssl.create_default_context(cafile=certifi.where())) as response:
-            content = response.read()
-    if len(content) < 10 or b"proxies" not in content and b"proxy-providers" not in content:
-        raise ValueError(f"Provider {provider.name!r} did not return a recognizable Clash/Mihomo YAML")
+        # Several providers return a generic Base64 URI list for Mihomo's own UA,
+        # but native Clash/Mihomo YAML for Clash.Meta. Prefer a native response over
+        # reimplementing protocol conversion locally.
+        candidates = [provider.user_agent, user_agent, "clash.meta", "Clash.Meta", "ClashforWindows/0.20.39"]
+        candidates = list(dict.fromkeys(value for value in candidates if value))
+        content, detected = b"", "empty"
+        context = ssl.create_default_context(cafile=certifi.where())
+        for candidate in candidates:
+            request = urllib.request.Request(source, headers={"User-Agent": candidate, "Accept": "*/*"})
+            try:
+                with urllib.request.urlopen(request, timeout=30, context=context) as response:
+                    content = response.read()
+            except urllib.error.HTTPError as exc:
+                detected = f"http-{exc.code}"
+                continue
+            except urllib.error.URLError:
+                detected = "network-error"
+                continue
+            detected = subscription_format(content)
+            if detected == "clash-yaml":
+                break
+    if detected != "clash-yaml":
+        raise ValueError(
+            f"Provider {provider.name!r} returned {detected}, not Clash/Mihomo YAML; "
+            "set provider.user_agent to a UA supported by the subscription service"
+        )
     ensure_private_file(target, content)
     return target
 

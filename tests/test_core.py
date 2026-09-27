@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import base64
+import io
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
+from clashbench.config import Provider
 from clashbench.db import add_measurements, begin_run, connect, finish_run
-from clashbench.engine import parse_faceair_tsv
+from clashbench.engine import materialize_provider, parse_faceair_tsv, subscription_format
 from clashbench.regions import classify_region, region_filter_regex
 from clashbench.report import build_summary, write_reports
 from clashbench.schedule import launch_agent
@@ -32,6 +37,23 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(values[1].available)
         self.assertNotIn("http", values[1].error or "")
 
+    def test_subscription_formats(self):
+        yaml_bytes = "proxies:\n  - {name: JP, type: ss, server: example.test, port: 443}\n".encode()
+        uri_list = b"vless://id@example.test:443#JP"
+        self.assertEqual(subscription_format(yaml_bytes), "clash-yaml")
+        self.assertEqual(subscription_format(uri_list), "uri-list")
+        self.assertEqual(subscription_format(base64.b64encode(uri_list)), "base64-uri-list")
+        self.assertEqual(subscription_format(b"<html><body>login</body></html>"), "html")
+
+    def test_subscription_user_agent_fallback(self):
+        yaml_bytes = b"proxies:\n  - {name: JP, type: ss, server: example.test, port: 443}\n"
+        rejected = urllib.error.HTTPError("https://redacted.invalid", 403, "Forbidden", {}, None)
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("clashbench.engine.provider_source", return_value="https://redacted.invalid"), \
+             patch("clashbench.engine.urllib.request.urlopen", side_effect=[rejected, io.BytesIO(yaml_bytes)]):
+            path = materialize_provider(Provider("demo", source_env="DEMO", user_agent="rejected"), Path(temp), "clash.meta")
+            self.assertEqual(subscription_format(path.read_bytes()), "clash-yaml")
+
     def test_redaction(self):
         value = redact("failed https://host/sub?token=abc token=abc")
         self.assertNotIn("host", value); self.assertNotIn("abc", value)
@@ -51,7 +73,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("demo", md.read_text()); self.assertIn("<table>", page.read_text())
             plist = launch_agent(root / "bench.toml", root, ["09:00", "00:00"])
             self.assertIn(b"StartCalendarInterval", plist)
+            conn.close()
 
 
 if __name__ == "__main__": unittest.main()
-

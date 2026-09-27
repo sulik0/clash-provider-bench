@@ -4,6 +4,8 @@ regions = ["JP", "HK", "SG", "US"]
 [[providers]]
 name = "taishan"
 source_env = "TAISHAN_SUB_URL"
+# Some providers return a Base64 URI list to Mihomo's UA but native YAML here.
+user_agent = "clash.meta"
 
 [[providers]]
 name = "cokecloud"
@@ -24,7 +26,7 @@ upload_size_mb = 10
 timeout_seconds = 8
 process_timeout_seconds = 3600
 concurrent = 4
-user_agent = "mihomo/1.19"
+user_agent = "clash.meta"
 
 [enrichment]
 # Starts a separate, isolated Mihomo process for each provider and selects every
@@ -42,4 +44,3 @@ days = 7
 # Override/add classification rules if your provider uses unusual names.
 # [region_patterns]
 # JP = ["(?i)日本|东京|JP"]
-

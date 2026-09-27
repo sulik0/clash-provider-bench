@@ -5,6 +5,7 @@
 ## 已实现
 
 - 输入多个订阅 URL（仅从环境变量读取）或本地 Clash/Mihomo YAML，并为每个来源保留 provider 名称。
+- 遇到服务商按 User-Agent 返回 Base64 URI 列表时，自动改用 `clash.meta` 等兼容 UA 请求原生 YAML；不自行重写 VLESS/AnyTLS 等协议转换。
 - JP/HK/SG/US/TW/KR/UK/DE 自动归类，可覆盖正则；`--regions JP,HK` 只测指定地区。
 - provider 严格顺序执行，节点使用相同 URL、文件大小、并发数和超时。
 - 原始结果保存在 SQLite；同时导出 UTF-8 CSV、Markdown 和静态 HTML。
@@ -115,6 +116,7 @@ clashbench schedule uninstall --config examples/bench.toml
 |---|---|
 | `regions` | 全局地区筛选；空数组表示全部。 |
 | `engine.server_url` | 所有供应商必须相同。无 path 的服务按 `clash-speedtest` 约定使用 `/__down` 和 `/__up`。 |
+| `providers.user_agent` | 可选的供应商级订阅 UA。若服务商默认返回 Base64 URI 列表，可设为 `clash.meta`。 |
 | `download_size_mb` / `upload_size_mb` | 每节点流量；节点多时先用 20/10 MB，正式跑可提高。 |
 | `concurrent` | 单节点下载并发。公平比较时固定，且不要同时运行别的重流量任务。 |
 | `enrichment.enabled` | 为每个 provider 启动隔离 Mihomo，获取出口信息。会增加时长。 |
@@ -140,6 +142,7 @@ clashbench schedule uninstall --config examples/bench.toml
 ## 已知限制
 
 - 顶层 `proxies:` 节点能生成最稳定的跨时间键。仅含远端 `proxy-providers:` 的配置仍可由 `clash-speedtest` 测试，但 orchestrator 在测速前看不到 provider 内部服务器字段，稳定键会退化为 provider + 节点名。
+- 对非 YAML 订阅会尝试多个成熟客户端 UA，要求服务商直接返回 Clash/Mihomo YAML。若服务商始终只提供 URI 列表，应在本机运行 subconverter 再输入生成的 YAML；工具不会把 token 发送给公共转换站。
 - `clash-speedtest` 当前 TSV 不暴露每次 HEAD 的 6 个单独样本，也不暴露其内部 download/upload error 独立字段；适配器会从格式化列区分数值和错误字符串。
 - `GLOBAL` 节点选择依赖 Mihomo 的 global 模式；极少数需要特殊 rule-provider 初始化的复杂配置可能无法 enrichment，但已经完成的测速结果仍会保留。
 - ChatGPT、YouTube、Netflix 检测只代表匿名 HTTP 可达性，页面策略和登录账户区域都可能改变结果。它们默认关闭。

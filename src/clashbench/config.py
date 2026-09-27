@@ -12,6 +12,7 @@ class Provider:
     name: str
     path: Path | None = None
     source_env: str | None = None
+    user_agent: str | None = None
 
 
 @dataclass
@@ -42,7 +43,8 @@ def load_config(path: str | Path) -> Settings:
         if has_path == has_env:
             raise ValueError(f"Provider {name!r} requires exactly one of path or source_env")
         provider_path = (root / item["path"]).resolve() if has_path else None
-        providers.append(Provider(name=name, path=provider_path, source_env=item.get("source_env")))
+        providers.append(Provider(name=name, path=provider_path, source_env=item.get("source_env"),
+                                  user_agent=item.get("user_agent")))
     if not providers:
         raise ValueError("At least one [[providers]] entry is required")
     database = (root / raw.get("database", "data/bench.sqlite3")).resolve()
@@ -69,4 +71,3 @@ def provider_source(provider: Provider) -> str | Path:
     if not value:
         raise ValueError(f"Missing environment variable {provider.source_env} for provider {provider.name!r}")
     return value
-
