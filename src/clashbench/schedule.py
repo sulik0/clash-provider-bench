@@ -10,8 +10,10 @@ LABEL = "local.clash-provider-bench"
 
 def launch_agent(
     config: Path, project: Path, times: list[str], python: Path | None = None,
-    quick: bool = True, regions: str | None = None,
+    mode: str = "two-stage", regions: str | None = None,
 ) -> bytes:
+    if mode not in {"two-stage", "quick", "full"}:
+        raise ValueError(f"Invalid schedule mode: {mode}")
     calendar = []
     for value in times:
         hour, minute = (int(x) for x in value.split(":", 1))
@@ -23,8 +25,10 @@ def launch_agent(
         "/usr/bin/caffeinate", "-i", str(python), "-m", "clashbench.cli",
         "run", "--config", str(config),
     ]
-    if quick:
+    if mode == "quick":
         command.append("--quick")
+    elif mode == "two-stage":
+        command.append("--two-stage")
     if regions:
         command.extend(["--regions", regions])
     payload = {

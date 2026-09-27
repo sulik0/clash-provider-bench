@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from contextlib import ExitStack
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from threading import Lock
+from dataclasses import dataclass
 
 import yaml
 import certifi
@@ -27,6 +29,14 @@ from .util import ensure_private_file
 
 TLS = ssl.create_default_context(cafile=certifi.where())
 UNLOCK_SERVICES = frozenset({"chatgpt", "youtube", "netflix"})
+
+
+@dataclass(frozen=True)
+class ChatGPTProbeResult:
+    overall: str
+    auth: str
+    static: str
+    websocket: str
 
 
 def classify_chatgpt_response(
@@ -62,6 +72,23 @@ def classify_chatgpt_response(
     )):
         return f"blocked:{status}{suffix}"
     return f"http-{status}{suffix}"
+
+
+def classify_reachability_response(
+    status: int, body: bytes, headers: dict[str, str] | None = None,
+) -> str:
+    """Classify domain/network reachability without claiming authentication success."""
+    headers = {str(key).lower(): str(value).lower() for key, value in (headers or {}).items()}
+    text = body.decode("utf-8", "replace").lower()
+    if headers.get("cf-mitigated") == "challenge" or any(marker in text for marker in (
+        "challenge-error-text", "attention required! | cloudflare", "cf-chl-", "just a moment...",
+    )):
+        return "challenge"
+    if status == 429:
+        return "rate-limited"
+    if status < 500:
+        return f"reachable:http-{status}"
+    return f"http-{status}"
 
 
 def _free_port() -> int:
@@ -218,7 +245,14 @@ class MihomoEnricher:
 
             if "chatgpt" in self.checks:
                 try:
-                    item.chatgpt = self._chatgpt(item.exit_country)
+                    result = self._chatgpt(item.exit_country)
+                    if isinstance(result, ChatGPTProbeResult):
+                        item.chatgpt = result.overall
+                        item.chatgpt_auth = result.auth
+                        item.chatgpt_static = result.static
+                        item.chatgpt_websocket = result.websocket
+                    else:  # Compatibility for custom/mock enrichers returning the legacy string.
+                        item.chatgpt = result
                 except Exception as exc:
                     item.chatgpt = f"error:{type(exc).__name__}"
                     errors.append(f"chatgpt:{type(exc).__name__}")
@@ -247,10 +281,60 @@ class MihomoEnricher:
             if progress:
                 progress(index, total, item, "done")
 
-    def _chatgpt(self, location: str | None = None) -> str:
+    def _websocket_probe(self) -> str:
+        """Reach OpenAI's Realtime WebSocket authentication boundary via Mihomo.
+
+        No API key is sent. HTTP 401/403 therefore confirms the CONNECT, TLS and
+        WebSocket upgrade request reached OpenAI; 101 is accepted if an upstream
+        deployment ever permits an unauthenticated upgrade.
+        """
+        target = "api.openai.com"
+        sock = socket.create_connection(("127.0.0.1", self.mixed_port), timeout=self.timeout)
+        try:
+            sock.settimeout(self.timeout)
+            sock.sendall(
+                f"CONNECT {target}:443 HTTP/1.1\r\nHost: {target}:443\r\n"
+                "Proxy-Connection: keep-alive\r\n\r\n".encode()
+            )
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 64_000:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            first = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
+            if " 200 " not in first:
+                return f"proxy-{first or 'no-response'}"
+            with TLS.wrap_socket(sock, server_hostname=target) as tls:
+                key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+                request = (
+                    "GET /v1/realtime?model=gpt-realtime HTTP/1.1\r\n"
+                    f"Host: {target}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                    "OpenAI-Beta: realtime=v1\r\nUser-Agent: clash-provider-bench\r\n\r\n"
+                )
+                tls.sendall(request.encode("ascii"))
+                raw = b""
+                while b"\r\n\r\n" not in raw and len(raw) < 64_000:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+            match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", raw)
+            if not match:
+                return "invalid-response"
+            status = int(match.group(1))
+            return "reachable:upgrade-101" if status == 101 else classify_reachability_response(status, raw)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _chatgpt(self, location: str | None = None) -> ChatGPTProbeResult:
         # A fresh session per node prevents cookies and pooled proxy connections
-        # from leaking across a GLOBAL selector change. The two requests for one
-        # node intentionally share a session, matching normal browser behavior.
+        # from leaking across a GLOBAL selector change. HTTP requests for one node
+        # intentionally share a session, matching normal browser behavior.
         session = browser_requests.Session(impersonate="chrome")
         try:
             if not location:
@@ -265,7 +349,7 @@ class MihomoEnricher:
                 status, raw, headers, location, self.chatgpt_unsupported_countries,
             )
             if not homepage.startswith("available"):
-                return homepage
+                return ChatGPTProbeResult(homepage, "not-run", "not-run", "not-run")
 
             # A page shell can load even when the ChatGPT backend is challenged. An
             # unauthenticated backend response (normally 401/403) proves reachability
@@ -279,14 +363,38 @@ class MihomoEnricher:
             )
             backend_text = backend_raw.decode("utf-8", "replace").lower()
             if backend.startswith(("challenge", "unsupported-country", "rate-limited")):
-                return backend
+                return ChatGPTProbeResult(backend, "not-run", "not-run", "not-run")
             if backend.startswith("blocked") and any(marker in backend_text for marker in (
                 "sorry, you have been blocked", "access denied", "you are unable to access chatgpt.com",
             )):
-                return backend
+                return ChatGPTProbeResult(backend, "not-run", "not-run", "not-run")
             if backend_status >= 500:
-                return f"backend-http-{backend_status}{':' + location.upper() if location else ''}"
-            return homepage
+                overall = f"backend-http-{backend_status}{':' + location.upper() if location else ''}"
+                return ChatGPTProbeResult(overall, "not-run", "not-run", "not-run")
+
+            try:
+                auth = classify_reachability_response(*self._browser_proxied(
+                    "https://auth.openai.com/", 64_000, session,
+                ))
+            except Exception as exc:
+                auth = f"error:{type(exc).__name__}"
+            try:
+                static = classify_reachability_response(*self._browser_proxied(
+                    "https://cdn.oaistatic.com/", 64_000, session,
+                ))
+            except Exception as exc:
+                static = f"error:{type(exc).__name__}"
+            try:
+                websocket = self._websocket_probe()
+            except Exception as exc:
+                websocket = f"error:{type(exc).__name__}"
+            overall = homepage
+            for name, result in (("auth", auth), ("static", static), ("websocket", websocket)):
+                if not result.startswith("reachable:"):
+                    suffix = f":{location.upper()}" if location else ""
+                    overall = f"{name}-{result}{suffix}"
+                    break
+            return ChatGPTProbeResult(overall, auth, static, websocket)
         finally:
             session.close()
 

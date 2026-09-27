@@ -33,6 +33,10 @@ def _cell(value: Any) -> str:
     return str(value if value is not None else "—").replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
 
 
+def _row_get(row: sqlite3.Row | dict[str, Any], key: str, default: Any = None) -> Any:
+    return row[key] if key in row.keys() else default
+
+
 def chatgpt_state(value: str | None) -> str:
     if not value:
         return "not-tested"
@@ -77,8 +81,8 @@ def _chatgpt_summary_table(items: list[dict[str, Any]]) -> list[str]:
 
 def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[str]:
     lines = [
-        "| Provider | 地区 | 节点 | 协议 | ChatGPT 结果 | 出口国家 | ASN |",
-        "|---|---|---|---|---|---|---|",
+        "| Provider | 地区 | 节点 | 协议 | ChatGPT 结果 | 认证域名 | 静态资源 | WebSocket | 大流量测速 | 出口国家 | ASN |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     found = False
     for row in rows:
@@ -88,10 +92,13 @@ def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[st
         lines.append(
             f"| {_cell(row['provider'])} | {_cell(row['region'])} | {_cell(row['node_name'])} | "
             f"{_cell(_dimension_value(row, 'proxy_type'))} | `{_cell(row['chatgpt'])}` | "
+            f"`{_cell(_row_get(row, 'chatgpt_auth'))}` | `{_cell(_row_get(row, 'chatgpt_static'))}` | "
+            f"`{_cell(_row_get(row, 'chatgpt_websocket'))}` | "
+            f"{'旧数据' if _row_get(row, 'throughput_attempted') is None else '已执行' if bool(_row_get(row, 'throughput_attempted')) else '未执行'} | "
             f"{_cell(row['exit_country'])} | {_cell(row['asn'])} |"
         )
     if not found:
-        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — |")
+        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — | — | — | — | — |")
     return lines
 
 
@@ -118,8 +125,17 @@ def summarize_rows(
     output: list[dict[str, Any]] = []
     for key, items in groups.items():
         available = [row for row in items if bool(row["available"])]
-        successful = [row for row in items if (row["status"] if "status" in row.keys() else ("ok" if row["available"] else "failed")) == "ok"]
-        failed = len(items) - len(successful)
+        attempted = [
+            row for row in items
+            if _row_get(row, "throughput_attempted", None) is None
+            or bool(_row_get(row, "throughput_attempted"))
+        ]
+        successful = [
+            row for row in attempted
+            if (row["status"] if "status" in row.keys() else ("ok" if row["available"] else "failed")) == "ok"
+            and row["download_mbps"] is not None
+        ]
+        failed = len(attempted) - len(successful)
         ttfb = [row["ttfb_ms"] for row in available if row["ttfb_ms"] is not None]
         jitter = [row["jitter_ms"] for row in available if row["jitter_ms"] is not None]
         loss = [row["packet_loss_pct"] for row in items if row["packet_loss_pct"] is not None]
@@ -136,9 +152,11 @@ def summarize_rows(
             cv = statistics.pstdev(download) / statistics.mean(download) * 100
         summary = {name: value for name, value in zip(dimensions, key)}
         summary.update({
-            "samples": len(items), "available_n": len(available), "success_n": len(successful), "failure_n": failed,
+            "samples": len(items), "available_n": len(available), "throughput_n": len(attempted),
+            "success_n": len(successful), "failure_n": failed,
             "availability": len(available) / len(items) * 100,
-            "success_rate": len(successful) / len(items) * 100, "failure_rate": failed / len(items) * 100,
+            "success_rate": len(successful) / len(attempted) * 100 if attempted else None,
+            "failure_rate": failed / len(attempted) * 100 if attempted else None,
             "ttfb_n": len(ttfb), "ttfb_p50": percentile(ttfb, .5), "ttfb_p95": percentile(ttfb, .95),
             "jitter_n": len(jitter), "jitter_p50": percentile(jitter, .5),
             "loss_n": len(loss), "loss_p50": percentile(loss, .5),
@@ -161,8 +179,8 @@ def find_anomalies(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in summary:
         reasons = []
         baseline = region_medians.get(item.get("region"))
-        if item["failure_rate"] >= 30:
-            reasons.append(f"失败率 {item['failure_rate']:.0f}% ({item['failure_n']}/{item['samples']})")
+        if item["failure_rate"] is not None and item["failure_rate"] >= 30:
+            reasons.append(f"失败率 {item['failure_rate']:.0f}% ({item['failure_n']}/{item['throughput_n']})")
         if item["loss_p50"] is not None and item["loss_p50"] >= 10:
             reasons.append(f"丢包 P50 {item['loss_p50']:.1f}% (n={item['loss_n']})")
         if baseline and item["ttfb_p50"] and item["ttfb_p50"] > baseline * 2:
@@ -251,14 +269,14 @@ def build_summary(
 def _summary_table(summary: list[dict[str, Any]], dimensions: tuple[str, ...]) -> list[str]:
     labels = {"provider": "供应商", "region": "地区", "proxy_type": "协议"}
     headers = [labels[name] for name in dimensions] + [
-        "总样本", "可用节点", "测速成功/失败", "可用率", "测速成功率", "测速失败率", "TTFB P50/P95 (n)", "抖动 P50 (n)", "丢包 P50 (n)",
+        "总样本", "可用节点", "吞吐尝试", "吞吐成功/失败", "可用率", "吞吐成功率", "吞吐失败率", "TTFB P50/P95 (n)", "抖动 P50 (n)", "丢包 P50 (n)",
         "下载 P50/P95 (n)", "上传 P50 (n)", "下载 CV (n)", "晚高峰衰减 (晚/日 n)",
     ]
-    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(dimensions) + ["---:"] * 13) + "|"]
+    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(dimensions) + ["---:"] * 14) + "|"]
     for row in summary:
         prefix = [str(row[name]) for name in dimensions]
         values = [
-            str(row["samples"]), str(row["available_n"]), f"{row['success_n']}/{row['failure_n']}",
+            str(row["samples"]), str(row["available_n"]), str(row["throughput_n"]), f"{row['success_n']}/{row['failure_n']}",
             _f(row["availability"], "%"), _f(row["success_rate"], "%"), _f(row["failure_rate"], "%"),
             f"{_f(row['ttfb_p50'],' ms')}/{_f(row['ttfb_p95'],' ms')} (n={row['ttfb_n']})",
             f"{_f(row['jitter_p50'],' ms')} (n={row['jitter_n']})",
@@ -300,8 +318,8 @@ def _conditions(run: sqlite3.Row) -> list[str]:
     chatgpt_probe = params.get("chatgpt_probe") or {}
     return [
         f"- 对比条件 ID：`{run['comparison_key'] or 'legacy:' + run['config_digest']}`",
-        f"- 引擎：{run['engine_version'] or run['engine']}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
-        f"- 文件大小：下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
+        f"- 引擎：{run['engine_version'] or run['engine']}；策略：{params.get('test_strategy', 'legacy-single-stage')}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
+        f"- 文件大小：单阶段下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；两阶段通过节点下载 {params.get('two_stage_download_size_mb', '—')} MB / 上传 {params.get('two_stage_upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
         f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；并行 worker：{params.get('enrichment_workers', 1)}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
         f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
         f"- 评测时区：{params.get('evaluation_timezone', 'Asia/Shanghai')}（数据库原始时间仍保存为 UTC）",
@@ -329,7 +347,7 @@ def current_report(conn: sqlite3.Connection, run_id: str, timezone_name: str = "
     out += ["", "## 本次：Provider × 地区", "", *_summary_table(regional, ("provider", "region")),
             "", "## 本次：Provider × 地区 × 协议", "", *_summary_table(protocol, ("provider", "region", "proxy_type")),
             "", "## 本次 ChatGPT 可用性", "", *_chatgpt_summary_table(chatgpt_summary(rows)),
-            "", "> `available` 表示该节点可正常取得 ChatGPT 未登录首页；`challenge`、`blocked` 和 `unsupported-country` 均不计为可用。该检测不使用账号，因此不能证明登录后对话一定成功。", "",
+            "", "> `available` 要求 ChatGPT 页面/后端、认证域名、静态资源域名及 Realtime WebSocket 认证边界全部可达。认证域名返回 401/403、WebSocket 在未提供 API key 时返回 401/403 都可证明网络路径可达，但不能证明账号登录或真实对话成功。", "",
             *_chatgpt_node_table(rows),
             "", "## 本次基础设施多样性", "", *_infra_table(infrastructure_summary(rows)), "", "## 本次异常", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
@@ -372,13 +390,13 @@ def trend_report(
 def _methodology() -> list[str]:
     return [
         "## 统计口径", "",
-        "- 总样本是节点测量记录数。可用表示延迟探测成功且丢包低于 100%；测速成功还要求当前模式所需的吞吐阶段没有错误。测速成功率与失败率的分母始终是总样本，因此下载失败但延迟可用的节点会计入“可用”，同时计入“测速失败”。",
-        "- 每个 P50/P95、CV 后的 `n` 是该指标实际使用的非空有效样本数。TTFB、抖动、下载、上传只使用测速成功且对应数值存在的记录；丢包使用所有具有丢包数值的记录。",
+        "- 总样本是节点测量记录数。可用表示轻量延迟探测成功且丢包低于 100%；吞吐成功/失败率的分母只包含实际进入下载/上传阶段的记录。两阶段模式中，未通过 ChatGPT 检查的节点不会做大流量测速，也不会被误算为吞吐失败。旧数据没有阶段标记时按已尝试吞吐处理。",
+        "- 每个 P50/P95、CV 后的 `n` 是该指标实际使用的非空有效样本数。TTFB 和抖动使用轻量探测可用且对应数值存在的记录；下载和上传使用实际取得该吞吐数值的记录；丢包使用所有具有丢包数值的记录。",
         "- 下载 CV = 下载速度总体标准差 / 均值，仅在至少 2 个下载有效样本时计算。CV 越低表示窗口内波动越小。",
         "- 晚高峰按报告配置的评测时区计算，为 20:00–23:59；日间基准为 09:00 与 14:00。默认评测时区是 Asia/Shanghai，括号显示晚高峰/日间有效下载样本数；负衰减表示晚高峰反而更快。",
         "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
         "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
-        "- ChatGPT 可用率的分母是实际完成 ChatGPT 检测的样本，只把 `available` 计为可用；地区不支持、Cloudflare challenge、明确阻断、限流和网络错误均不计为可用。它是未登录网络可达性检查，不使用或验证你的 ChatGPT 账号。",
+        "- ChatGPT 可用率的分母是实际完成 ChatGPT 检测的样本，只把所有页面/后端、认证、静态资源和 WebSocket 子检查均可达的 `available` 计为可用；地区不支持、Cloudflare challenge、明确阻断、限流和网络错误均不计为可用。它是未登录网络可达性检查，不使用或验证你的 ChatGPT 账号。",
     ]
 
 

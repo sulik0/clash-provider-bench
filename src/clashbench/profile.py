@@ -35,11 +35,14 @@ def benchmark_profile(
     parameters = {
         "adapter": str(engine.get("adapter", "faceair")),
         "engine_version": engine_version,
+        "test_strategy": str(engine.get("test_strategy", "single-stage")),
         "speed_mode": str(engine.get("speed_mode", "full")),
         "server_url": safe_endpoint(endpoint_value),
         "server_query_hash": hashlib.sha256(endpoint_query.encode()).hexdigest()[:12] if endpoint_query else None,
         "download_size_mb": int(engine.get("download_size_mb", 20)),
         "upload_size_mb": int(engine.get("upload_size_mb", 10)),
+        "two_stage_download_size_mb": int(engine.get("two_stage_download_size_mb", 50)),
+        "two_stage_upload_size_mb": int(engine.get("two_stage_upload_size_mb", 20)),
         "timeout_seconds": int(engine.get("timeout_seconds", 8)),
         "process_timeout_seconds": int(engine.get("process_timeout_seconds", 3600)),
         "concurrent": int(engine.get("concurrent", 4)),
@@ -54,7 +57,10 @@ def benchmark_profile(
         ) if "chatgpt" in {str(value).lower() for value in enrichment_checks} else [],
         "chatgpt_probe": {
             "client": "curl_cffi", "version": curl_cffi.__version__, "impersonate": "chrome",
-            "endpoints": ["homepage", "backend-api/me"],
+            "endpoints": [
+                "chatgpt.com homepage", "chatgpt.com/backend-api/me", "auth.openai.com",
+                "cdn.oaistatic.com", "api.openai.com realtime WebSocket",
+            ],
         } if "chatgpt" in {str(value).lower() for value in enrichment_checks} else None,
         "evaluation_timezone": str(settings.report.get("timezone", "Asia/Shanghai")),
         "platform": platform.system(),

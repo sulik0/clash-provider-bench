@@ -47,6 +47,10 @@ class Measurement:
     chatgpt: str | None = None
     youtube: str | None = None
     netflix: str | None = None
+    chatgpt_auth: str | None = None
+    chatgpt_static: str | None = None
+    chatgpt_websocket: str | None = None
+    throughput_attempted: bool | None = None
     enrichment_status: str = "not_requested"
     enrichment_error: str | None = None
 
@@ -79,7 +83,10 @@ def _parse_speed_mbps(value: str) -> tuple[float | None, str | None]:
     return amount * multipliers[match.group(2)] * 8 / 1_000_000, None
 
 
-def parse_faceair_tsv(text: str, provider: str, nodes: dict[str, dict[str, Any]], patterns=None) -> list[Measurement]:
+def parse_faceair_tsv(
+    text: str, provider: str, nodes: dict[str, dict[str, Any]], patterns=None,
+    *, throughput_attempted: bool | None = None,
+) -> list[Measurement]:
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     results: list[Measurement] = []
     for row in reader:
@@ -111,6 +118,7 @@ def parse_faceair_tsv(text: str, provider: str, nodes: dict[str, dict[str, Any]]
                 upload_mbps=upload,
                 status="ok" if available and not error else "failed",
                 error=error,
+                throughput_attempted=throughput_attempted,
             )
         )
     return results
@@ -122,6 +130,12 @@ def load_nodes(path: Path) -> dict[str, dict[str, Any]]:
     except Exception:
         return {}
     return {str(node.get("name")): node for node in data.get("proxies", []) if isinstance(node, dict) and node.get("name")}
+
+
+def _go_regex_literal(value: str) -> str:
+    """Quote a node name for clash-speedtest's Go/RE2 filter syntax."""
+    special = frozenset(r"\.+*?()|[]{}^$")
+    return "".join(f"\\{char}" if char in special else char for char in value)
 
 
 def subscription_format(content: bytes) -> str:
@@ -211,22 +225,29 @@ class FaceairAdapter:
     def run(
         self, provider: Provider, config_path: Path, regions: list[str],
         progress: Callable[[str], None] | None = None,
+        *, speed_mode: str | None = None, node_names: set[str] | None = None,
+        download_size_mb: int | None = None, upload_size_mb: int | None = None,
     ) -> list[Measurement]:
         engine = self.settings.engine
-        speed_mode = str(engine.get("speed_mode", "full"))
+        speed_mode = speed_mode or str(engine.get("speed_mode", "full"))
         nodes = load_nodes(config_path)
-        selected_nodes = sum(
-            1 for name in nodes
-            if not regions or classify_region(name, self.settings.region_patterns) in regions
-        )
+        if node_names is not None:
+            selected_nodes = sum(name in node_names for name in nodes)
+            node_filter = r"^(?:" + "|".join(_go_regex_literal(name) for name in sorted(node_names)) + r")$"
+        else:
+            selected_nodes = sum(
+                1 for name in nodes
+                if not regions or classify_region(name, self.settings.region_patterns) in regions
+            )
+            node_filter = region_filter_regex(regions, self.settings.region_patterns)
         args = [
             self.binary,
             "-c", str(config_path),
-            "-f", region_filter_regex(regions, self.settings.region_patterns),
+            "-f", node_filter,
             "-speed-mode", speed_mode,
             "-server-url", str(engine.get("server_url", "https://speed.cloudflare.com")),
-            "-download-size", str(int(engine.get("download_size_mb", 20)) * 1024 * 1024),
-            "-upload-size", str(int(engine.get("upload_size_mb", 10)) * 1024 * 1024),
+            "-download-size", str(int(download_size_mb or engine.get("download_size_mb", 20)) * 1024 * 1024),
+            "-upload-size", str(int(upload_size_mb or engine.get("upload_size_mb", 10)) * 1024 * 1024),
             "-timeout", f"{int(engine.get('timeout_seconds', 8))}s",
             "-concurrent", str(int(engine.get("concurrent", 4))),
         ]
@@ -252,7 +273,10 @@ class FaceairAdapter:
                     progress(f"测速内核运行中：已用时 {int(time.monotonic() - started)} 秒")
         if proc.returncode != 0:
             raise RuntimeError(f"clash-speedtest failed for provider {provider.name!r}: {redact(stderr)[-600:]}")
-        values = parse_faceair_tsv(stdout, provider.name, nodes, self.settings.region_patterns)
+        values = parse_faceair_tsv(
+            stdout, provider.name, nodes, self.settings.region_patterns,
+            throughput_attempted=speed_mode != "fast",
+        )
         if progress:
             progress(f"测速内核完成：返回 {len(values)} 条节点结果，用时 {int(time.monotonic() - started)} 秒")
         return values

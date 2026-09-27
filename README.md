@@ -50,6 +50,7 @@ clashbench doctor --config examples/bench.toml
 
 ```bash
 clashbench run --config examples/bench.toml
+clashbench run --config examples/bench.toml --two-stage
 clashbench run --config examples/bench.toml --regions JP,HK
 clashbench run --config examples/bench.toml --quick
 ```
@@ -72,8 +73,9 @@ clashbench report --config examples/bench.toml --run-id <run-id>
 
 ```bash
 clashbench schedule install --config examples/bench.toml --regions JP,SG,US
-# 如需定时运行完整下载测速，而不是默认的快速可用性检查：
+# 默认使用两阶段评测；也可改为全节点完整测速或仅快速检查：
 clashbench schedule install --config examples/bench.toml --full
+clashbench schedule install --config examples/bench.toml --quick-only
 clashbench schedule uninstall --config examples/bench.toml
 ```
 

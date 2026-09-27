@@ -15,7 +15,7 @@ from .db import (
     add_measurements, begin_provider, begin_run, connect, export_csv, finish_provider,
     finish_run, latest_run_id, rotated_providers,
 )
-from .engine import FaceairAdapter, materialize_provider, parse_faceair_tsv, write_mock_tsv
+from .engine import FaceairAdapter, Measurement, materialize_provider, parse_faceair_tsv, write_mock_tsv
 from .enrich import MihomoEnricherPool
 from .environment import capture_network_environment
 from .notifications import notify_run, send_macos_notification
@@ -34,9 +34,14 @@ def _parser() -> argparse.ArgumentParser:
         if name == "run":
             cmd.add_argument("--regions", help="Comma-separated override, e.g. JP,HK")
             cmd.add_argument("--mock", action="store_true", help="Store deterministic fixtures; no network or real test")
-            cmd.add_argument(
+            mode = cmd.add_mutually_exclusive_group()
+            mode.add_argument(
                 "--quick", action="store_true",
                 help="Skip download/upload throughput and prioritize availability/ChatGPT checks",
+            )
+            mode.add_argument(
+                "--two-stage", action="store_true",
+                help="Screen all nodes quickly, then throughput-test only ChatGPT-available nodes",
             )
     report = sub.add_parser("report")
     report.add_argument("--config", default="bench.toml"); report.add_argument("--days", type=int, default=7); report.add_argument("--output", default="reports")
@@ -49,7 +54,9 @@ def _parser() -> argparse.ArgumentParser:
     schedule = sub.add_parser("schedule")
     schedule.add_argument("action", choices=("render", "install", "uninstall")); schedule.add_argument("--config", default="bench.toml")
     schedule.add_argument("--times", default="09:00,14:00,20:00,22:00,00:00"); schedule.add_argument("--output")
-    schedule.add_argument("--full", action="store_true", help="Schedule full throughput tests instead of the default quick checks")
+    schedule_mode = schedule.add_mutually_exclusive_group()
+    schedule_mode.add_argument("--full", action="store_true", help="Schedule single-stage full throughput tests")
+    schedule_mode.add_argument("--quick-only", action="store_true", help="Schedule quick checks without second-stage throughput")
     schedule.add_argument("--regions", help="Comma-separated region override for scheduled runs")
     return p
 
@@ -61,6 +68,31 @@ def _progress(
     print(f"[{timestamp}] [{prefix}] {message}", file=file if file is not None else sys.stdout, flush=True)
 
 
+def merge_two_stage(first_stage: list[Measurement], second_stage: list[Measurement]) -> None:
+    """Merge throughput results while preserving first-stage ChatGPT/egress diagnostics."""
+    second_by_name = {item.node_name: item for item in second_stage}
+    for item in first_stage:
+        if not (item.chatgpt or "").startswith("available"):
+            item.throughput_attempted = False
+            continue
+        item.throughput_attempted = True
+        measured = second_by_name.get(item.node_name)
+        if not measured:
+            item.status = "failed"
+            item.error = "throughput result missing"
+            item.download_mbps = None
+            item.upload_mbps = None
+            continue
+        item.available = measured.available
+        item.ttfb_ms = measured.ttfb_ms
+        item.jitter_ms = measured.jitter_ms
+        item.packet_loss_pct = measured.packet_loss_pct
+        item.download_mbps = measured.download_mbps
+        item.upload_mbps = measured.upload_mbps
+        item.status = measured.status
+        item.error = measured.error
+
+
 def cmd_run(args) -> int:
     config_path = Path(args.config).expanduser().resolve()
     load_dotenv(config_path.parent / ".env")
@@ -68,6 +100,21 @@ def cmd_run(args) -> int:
     timezone_name = str(settings.report.get("timezone", "Asia/Shanghai"))
     if args.quick:
         settings.engine["speed_mode"] = "fast"
+        settings.engine["test_strategy"] = "quick"
+    elif args.two_stage:
+        if str(settings.engine.get("speed_mode", "full")) == "fast":
+            raise ValueError("--two-stage requires engine.speed_mode=download or full for stage 2")
+        configured_checks = settings.enrichment.get("checks")
+        chatgpt_enabled = (
+            bool(settings.enrichment.get("enabled", False))
+            and bool(settings.enrichment.get("unlock", False))
+            and (configured_checks is None or "chatgpt" in {str(value).lower() for value in configured_checks})
+        )
+        if not chatgpt_enabled:
+            raise ValueError("--two-stage requires enabled ChatGPT enrichment")
+        settings.engine["test_strategy"] = "two-stage"
+    else:
+        settings.engine["test_strategy"] = "single-stage"
 
     def progress(prefix: str, message: str, *, file=None) -> None:
         _progress(prefix, message, timezone_name, file=file)
@@ -92,7 +139,7 @@ def cmd_run(args) -> int:
     )
     runtime = settings.root / ".runtime" / run_id
     errors, total = [], 0
-    mode = "快速可用性检查" if args.quick else "完整配置评测"
+    mode = "快速可用性检查" if args.quick else "两阶段 ChatGPT 优先评测" if args.two_stage else "完整配置评测"
     progress("run", f"开始 {run_id}；模式：{mode}；Provider 顺序：{' → '.join(provider_order)}")
     active_provider: str | None = None
     try:
@@ -104,14 +151,23 @@ def cmd_run(args) -> int:
             try:
                 if args.mock:
                     progress(prefix, "生成 mock 测试数据")
-                    values = parse_faceair_tsv(write_mock_tsv(runtime, provider.name), provider.name, {}, settings.region_patterns)
+                    values = parse_faceair_tsv(
+                        write_mock_tsv(runtime, provider.name), provider.name, {}, settings.region_patterns,
+                        throughput_attempted=not (args.quick or args.two_stage),
+                    )
                     values = [x for x in values if not regions or x.region in regions]
                 else:
                     config = materialize_provider(
                         provider, runtime, str(settings.engine.get("user_agent", "mihomo/1.19")),
                         lambda message: progress(prefix, message),
                     )
-                    values = adapter.run(provider, config, regions, lambda message: progress(prefix, message))
+                    stage_speed = "fast" if args.two_stage else None
+                    if args.two_stage:
+                        progress(prefix, "阶段 1/2：全节点轻量测速与 ChatGPT 可用性筛选")
+                    values = adapter.run(
+                        provider, config, regions, lambda message: progress(prefix, message),
+                        speed_mode=stage_speed,
+                    )
                     if settings.enrichment.get("enabled", False):
                         try:
                             mihomo_binary = str(settings.enrichment.get("mihomo_binary", "mihomo"))
@@ -157,6 +213,32 @@ def cmd_run(args) -> int:
                                 else:
                                     item.enrichment_status = "skipped"
                             progress(prefix, f"enrichment failed: {type(exc).__name__}", file=sys.stderr)
+                    if args.two_stage:
+                        selected_names = {
+                            item.node_name for item in values
+                            if (item.chatgpt or "").startswith("available")
+                        }
+                        progress(
+                            prefix,
+                            f"阶段 1/2 完成：{len(selected_names)}/{len(values)} 个节点通过 ChatGPT 检查",
+                        )
+                        second_stage: list[Measurement] = []
+                        if selected_names:
+                            progress(
+                                prefix,
+                                f"阶段 2/2：仅对 {len(selected_names)} 个通过节点进行大流量测速",
+                            )
+                            second_stage = adapter.run(
+                                provider, config, regions,
+                                lambda message: progress(prefix, f"阶段 2/2：{message}"),
+                                speed_mode=str(settings.engine.get("speed_mode", "download")),
+                                node_names=selected_names,
+                                download_size_mb=int(settings.engine.get("two_stage_download_size_mb", 50)),
+                                upload_size_mb=int(settings.engine.get("two_stage_upload_size_mb", 20)),
+                            )
+                        else:
+                            progress(prefix, "阶段 2/2：没有 ChatGPT 可用节点，跳过大流量测速")
+                        merge_two_stage(values, second_stage)
                 count = add_measurements(conn, run_id, values)
                 total += count
                 finish_provider(conn, run_id, provider.name, "ok", count)
@@ -280,7 +362,8 @@ def cmd_schedule(args) -> int:
         print(f"removed {target}"); return 0
     content = launch_agent(
         config, project, [x.strip() for x in args.times.split(",")],
-        quick=not args.full, regions=args.regions,
+        mode="full" if args.full else "quick" if args.quick_only else "two-stage",
+        regions=args.regions,
     )
     (project / "data").mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.action == "render":

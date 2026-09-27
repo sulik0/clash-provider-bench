@@ -56,6 +56,7 @@ def load_config(path: str | Path) -> Settings:
     for name, default in (
         ("download_size_mb", 20), ("upload_size_mb", 10), ("timeout_seconds", 8),
         ("process_timeout_seconds", 3600), ("concurrent", 4), ("progress_interval_seconds", 5),
+        ("two_stage_download_size_mb", 50), ("two_stage_upload_size_mb", 20),
     ):
         if int(engine.get(name, default)) <= 0:
             raise ValueError(f"engine.{name} must be greater than zero")

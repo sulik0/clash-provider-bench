@@ -17,12 +17,15 @@ from unittest.mock import MagicMock, patch
 import yaml
 
 from clashbench.config import Provider, Settings, load_config
-from clashbench.cli import main as cli_main
+from clashbench.cli import main as cli_main, merge_two_stage
 from clashbench.db import (
     add_measurements, begin_run, connect, finish_run, rotated_providers,
 )
 from clashbench.engine import FaceairAdapter, Measurement, materialize_provider, parse_faceair_tsv, subscription_format
-from clashbench.enrich import MihomoEnricher, MihomoEnricherPool, classify_chatgpt_response
+from clashbench.enrich import (
+    MihomoEnricher, MihomoEnricherPool, classify_chatgpt_response,
+    classify_reachability_response,
+)
 from clashbench.environment import capture_network_environment
 from clashbench.notifications import notification_text, send_macos_notification
 from clashbench.profile import benchmark_profile
@@ -129,6 +132,26 @@ workers = 0
             self.assertTrue(any("已用时" in message for message in messages))
             self.assertTrue(any("测速内核完成" in message for message in messages))
 
+    def test_faceair_adapter_can_target_exact_nodes_for_second_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "provider.yaml"
+            config.write_text("proxies:\n  - {name: 'JP [A]+', type: ss, server: test, port: 443}\n", encoding="utf-8")
+            settings = Settings(
+                root=root, database=root / "test.db", providers=[], regions=["JP"],
+                engine={"binary": "fake", "speed_mode": "download"},
+            )
+            process = MagicMock(returncode=0)
+            process.communicate.return_value = (TSV, "")
+            with patch("clashbench.engine.subprocess.Popen", return_value=process) as popen:
+                FaceairAdapter(settings).run(
+                    Provider("demo"), config, ["JP"], speed_mode="download",
+                    node_names={"JP [A]+"}, download_size_mb=50, upload_size_mb=20,
+                )
+            args = popen.call_args.args[0]
+            self.assertEqual(args[args.index("-f") + 1], r"^(?:JP \[A\]\+)$")
+            self.assertEqual(args[args.index("-download-size") + 1], str(50 * 1024 * 1024))
+
     def test_subscription_formats_and_user_agent_fallback(self):
         yaml_bytes = b"proxies:\n  - {name: JP, type: ss, server: example.test, port: 443}\n"
         uri_list = b"vless://id@example.test:443#JP"
@@ -168,7 +191,10 @@ workers = 0
             conn = connect(path)
             self.assertEqual(conn.execute("SELECT id FROM runs").fetchone()["id"], "legacy")
             self.assertIn("comparison_key", {row["name"] for row in conn.execute("PRAGMA table_info(runs)")})
-            self.assertIn("enrichment_status", {row["name"] for row in conn.execute("PRAGMA table_info(measurements)")})
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(measurements)")}
+            self.assertIn("enrichment_status", columns)
+            self.assertIn("chatgpt_websocket", columns)
+            self.assertIn("throughput_attempted", columns)
             conn.close()
 
     def test_statistics_report_effective_sample_counts_and_protocols(self):
@@ -188,6 +214,21 @@ workers = 0
         self.assertEqual((summary["ttfb_n"], summary["jitter_n"], summary["download_n"], summary["loss_n"]), (2, 1, 1, 3))
         protocols = summarize_rows(rows, ("provider", "region", "proxy_type"))
         self.assertEqual({item["proxy_type"] for item in protocols}, {"VLESS", "Hysteria2"})
+
+    def test_two_stage_statistics_exclude_screened_nodes_from_failure_rate(self):
+        rows = [
+            {"provider": "a", "region": "JP", "proxy_type": "VLESS", "available": 1,
+             "ttfb_ms": 40, "jitter_ms": 4, "packet_loss_pct": 0, "download_mbps": 100,
+             "upload_mbps": 20, "status": "ok", "throughput_attempted": 1,
+             "tested_at": "2026-09-27T01:00:00+00:00"},
+            {"provider": "a", "region": "JP", "proxy_type": "VLESS", "available": 1,
+             "ttfb_ms": 60, "jitter_ms": 5, "packet_loss_pct": 0, "download_mbps": None,
+             "upload_mbps": None, "status": "ok", "throughput_attempted": 0,
+             "tested_at": "2026-09-27T01:00:00+00:00"},
+        ]
+        summary = summarize_rows(rows, ("provider", "region"))[0]
+        self.assertEqual((summary["samples"], summary["throughput_n"], summary["success_n"]), (2, 1, 1))
+        self.assertEqual(summary["failure_rate"], 0)
 
     def test_report_time_buckets_use_configured_timezone(self):
         rows = [{
@@ -278,6 +319,9 @@ workers = 0
         item = chatgpt_summary(rows)[0]
         self.assertEqual((item["samples"], item["checked"], item["available"], item["challenge"]), (3, 2, 1, 1))
         self.assertEqual(item["availability"], 50)
+        self.assertEqual(classify_reachability_response(401, b"auth required"), "reachable:http-401")
+        self.assertEqual(classify_reachability_response(404, b"not found"), "reachable:http-404")
+        self.assertEqual(classify_reachability_response(503, b"down"), "http-503")
 
     def test_chatgpt_check_still_runs_when_ip_lookup_fails(self):
         item = measurement("a", "node")
@@ -304,13 +348,32 @@ workers = 0
         with patch.object(enricher, "_browser_proxied", side_effect=[
             (200, b"homepage", {}),
             (403, b'{"detail":"authentication required"}', {}),
-        ]):
-            self.assertEqual(enricher._chatgpt("US"), "available:US")
+            (403, b"auth required", {}),
+            (404, b"not found", {}),
+        ]), patch.object(enricher, "_websocket_probe", return_value="reachable:http-401"):
+            result = enricher._chatgpt("US")
+            self.assertEqual(result.overall, "available:US")
+            self.assertEqual(result.auth, "reachable:http-403")
+            self.assertEqual(result.static, "reachable:http-404")
+            self.assertEqual(result.websocket, "reachable:http-401")
         with patch.object(enricher, "_browser_proxied", side_effect=[
             (200, b"homepage", {}),
             (403, b"challenge", {"Cf-Mitigated": "challenge"}),
         ]):
-            self.assertEqual(enricher._chatgpt("JP"), "challenge:JP")
+            self.assertEqual(enricher._chatgpt("JP").overall, "challenge:JP")
+
+    def test_two_stage_merge_only_marks_chatgpt_available_nodes_attempted(self):
+        passed = measurement("a", "passed", download=None)
+        passed.chatgpt = "available:JP"
+        blocked = measurement("a", "blocked", download=None)
+        blocked.chatgpt = "challenge:JP"
+        result = measurement("a", "passed", download=500)
+        result.throughput_attempted = True
+        merge_two_stage([passed, blocked], [result])
+        self.assertTrue(passed.throughput_attempted)
+        self.assertEqual(passed.download_mbps, 500)
+        self.assertFalse(blocked.throughput_attempted)
+        self.assertIsNone(blocked.download_mbps)
 
     def test_mihomo_ports_are_distinct(self):
         with patch("clashbench.enrich._free_port", side_effect=[18080, 18080, 19090]):
@@ -398,7 +461,7 @@ rule-providers:
             self.assertIn(b"StartCalendarInterval", plist)
             payload = plistlib.loads(plist)
             self.assertEqual(payload["ProgramArguments"][:2], ["/usr/bin/caffeinate", "-i"])
-            self.assertIn("--quick", payload["ProgramArguments"])
+            self.assertIn("--two-stage", payload["ProgramArguments"])
             self.assertEqual(payload["ProgramArguments"][-2:], ["--regions", "JP,SG,US"])
             self.assertEqual(payload["ProcessType"], "Standard")
             conn.close()

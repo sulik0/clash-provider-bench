@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS measurements (
   ttfb_ms REAL, jitter_ms REAL, packet_loss_pct REAL, download_mbps REAL, upload_mbps REAL,
   status TEXT NOT NULL, error TEXT, exit_ip TEXT, exit_country TEXT, exit_region TEXT,
   asn TEXT, as_org TEXT, chatgpt TEXT, youtube TEXT, netflix TEXT, raw_json TEXT NOT NULL,
-  enrichment_status TEXT NOT NULL DEFAULT 'legacy-unknown', enrichment_error TEXT
+  enrichment_status TEXT NOT NULL DEFAULT 'legacy-unknown', enrichment_error TEXT,
+  chatgpt_auth TEXT, chatgpt_static TEXT, chatgpt_websocket TEXT,
+  throughput_attempted INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_measurements_time ON measurements(tested_at);
 CREATE INDEX IF NOT EXISTS idx_measurements_provider_region ON measurements(provider, region);
@@ -47,6 +49,10 @@ RUN_MIGRATIONS = {
 MEASUREMENT_MIGRATIONS = {
     "enrichment_status": "TEXT NOT NULL DEFAULT 'legacy-unknown'",
     "enrichment_error": "TEXT",
+    "chatgpt_auth": "TEXT",
+    "chatgpt_static": "TEXT",
+    "chatgpt_websocket": "TEXT",
+    "throughput_attempted": "INTEGER",
 }
 
 
@@ -134,13 +140,16 @@ def add_measurements(conn: sqlite3.Connection, run_id: str, values: Iterable[Mea
             int(item.available), item.ttfb_ms, item.jitter_ms, item.packet_loss_pct, item.download_mbps,
             item.upload_mbps, item.status, item.error, item.exit_ip, item.exit_country, item.exit_region,
             item.asn, item.as_org, item.chatgpt, item.youtube, item.netflix, json.dumps(raw, ensure_ascii=False),
-            item.enrichment_status, item.enrichment_error))
+            item.enrichment_status, item.enrichment_error, item.chatgpt_auth, item.chatgpt_static,
+            item.chatgpt_websocket,
+            None if item.throughput_attempted is None else int(item.throughput_attempted)))
     conn.executemany(
         """INSERT INTO measurements (
         run_id,tested_at,provider,node_name,node_key,proxy_type,region,available,ttfb_ms,jitter_ms,
         packet_loss_pct,download_mbps,upload_mbps,status,error,exit_ip,exit_country,exit_region,asn,
-        as_org,chatgpt,youtube,netflix,raw_json,enrichment_status,enrichment_error)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        as_org,chatgpt,youtube,netflix,raw_json,enrichment_status,enrichment_error,chatgpt_auth,
+        chatgpt_static,chatgpt_websocket,throughput_attempted)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
     conn.commit()
     return len(rows)
 
