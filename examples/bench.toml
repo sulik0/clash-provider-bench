@@ -37,6 +37,9 @@ user_agent = "clash.meta"
 enabled = true
 mihomo_binary = "../tools/bin/mihomo"
 timeout_seconds = 15
+# Each worker owns a separate Mihomo process, so selectors and proxy sessions do
+# not leak across nodes. Four workers make the HTTP-only enrichment phase much faster.
+workers = 4
 # ChatGPT is the primary goal. Skip YouTube/Netflix to reduce per-node runtime.
 unlock = true
 checks = ["chatgpt"]
@@ -48,6 +51,11 @@ chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 output = "../reports"
 days = 7
 timezone = "Asia/Shanghai"
+
+[notification]
+# Send a native macOS notification after every scheduled or manual real run.
+enabled = true
+mode = "macos"
 
 # Override/add classification rules if your provider uses unusual names.
 # [region_patterns]

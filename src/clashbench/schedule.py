@@ -8,7 +8,10 @@ from pathlib import Path
 LABEL = "local.clash-provider-bench"
 
 
-def launch_agent(config: Path, project: Path, times: list[str], python: Path | None = None) -> bytes:
+def launch_agent(
+    config: Path, project: Path, times: list[str], python: Path | None = None,
+    quick: bool = True, regions: str | None = None,
+) -> bytes:
     calendar = []
     for value in times:
         hour, minute = (int(x) for x in value.split(":", 1))
@@ -16,13 +19,19 @@ def launch_agent(config: Path, project: Path, times: list[str], python: Path | N
             raise ValueError(f"Invalid schedule time: {value}")
         calendar.append({"Hour": hour, "Minute": minute})
     python = python or Path(sys.executable)
-    command = [str(python), "-m", "clashbench.cli", "run", "--config", str(config)]
+    command = [
+        "/usr/bin/caffeinate", "-i", str(python), "-m", "clashbench.cli",
+        "run", "--config", str(config),
+    ]
+    if quick:
+        command.append("--quick")
+    if regions:
+        command.extend(["--regions", regions])
     payload = {
         "Label": LABEL, "ProgramArguments": command, "WorkingDirectory": str(project),
         "StartCalendarInterval": calendar, "RunAtLoad": False,
         "StandardOutPath": str(project / "data" / "launchd.stdout.log"),
         "StandardErrorPath": str(project / "data" / "launchd.stderr.log"),
-        "ProcessType": "Background",
+        "ProcessType": "Standard", "Umask": 0o077,
     }
     return plistlib.dumps(payload, sort_keys=False)
-

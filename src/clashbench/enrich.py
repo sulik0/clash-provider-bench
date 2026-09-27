@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -11,8 +12,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from threading import Lock
 
 import yaml
 import certifi
@@ -101,6 +105,10 @@ class MihomoEnricher:
         config.update({
             "mixed-port": self.mixed_port, "external-controller": f"127.0.0.1:{self.controller_port}",
             "secret": self.secret, "allow-lan": False, "mode": "global", "log-level": "silent",
+            # Global mode never evaluates rules. Removing them from the isolated
+            # temporary config avoids needless GeoIP/GeoSite database downloads
+            # for every worker while preserving all proxies and proxy groups.
+            "rules": [], "rule-providers": {},
         })
         self.runtime.mkdir(parents=True, exist_ok=True)
         generated = self.runtime / "config.yaml"
@@ -115,7 +123,13 @@ class MihomoEnricher:
                 if self.process.poll() is not None:
                     break
                 time.sleep(.25)
-        stderr = self.process.stderr.read(500) if self.process and self.process.stderr else ""
+        stderr = ""
+        if self.process and self.process.stderr:
+            try:
+                os.set_blocking(self.process.stderr.fileno(), False)
+                stderr = self.process.stderr.read(500) or ""
+            except (OSError, ValueError):
+                pass
         self.__exit__(None, None, None)
         raise RuntimeError(f"mihomo did not become ready: {stderr}")
 
@@ -279,3 +293,97 @@ class MihomoEnricher:
     def _simple_unlock(self, url: str) -> str:
         status, _, _ = self._proxied(url, 128_000)
         return "reachable" if 200 <= status < 400 else f"blocked:{status}"
+
+
+class MihomoEnricherPool:
+    """Run independent Mihomo instances so per-node HTTP checks can overlap safely.
+
+    A single Mihomo GLOBAL selector is process-wide, so sharing one process across
+    threads would route requests through the wrong node. Each worker therefore has
+    its own controller, proxy port, data directory, and selector state.
+    """
+
+    def __init__(
+        self, binary: str, runtime: Path, source_config: Path, unlock: bool = False,
+        timeout: int = 15, checks: Iterable[str] | None = None,
+        chatgpt_unsupported_countries: Iterable[str] = (), workers: int = 1,
+    ):
+        self.binary = binary
+        self.runtime = runtime
+        self.source_config = source_config
+        self.unlock = unlock
+        self.timeout = timeout
+        self.requested_checks = checks
+        self.chatgpt_unsupported_countries = tuple(chatgpt_unsupported_countries)
+        self.requested_workers = max(1, int(workers))
+        self._stack: ExitStack | None = None
+        self._workers: list[MihomoEnricher] = []
+        self.startup_errors: list[str] = []
+        self.checks: set[str] = set()
+
+    @property
+    def active_workers(self) -> int:
+        return len(self._workers)
+
+    def __enter__(self):
+        self._stack = ExitStack()
+        for index in range(self.requested_workers):
+            worker_runtime = self.runtime / f"enrichment-worker-{index + 1}"
+            try:
+                worker = MihomoEnricher(
+                    self.binary, worker_runtime, self.source_config, self.unlock,
+                    self.timeout, self.requested_checks,
+                    self.chatgpt_unsupported_countries,
+                )
+                # Start workers one at a time. This lets each Mihomo bind its ports
+                # before another worker asks the OS for ephemeral ports.
+                self._workers.append(self._stack.enter_context(worker))
+            except Exception as exc:
+                self.startup_errors.append(type(exc).__name__)
+        if not self._workers:
+            self._stack.close()
+            self._stack = None
+            detail = ",".join(self.startup_errors) or "unknown"
+            raise RuntimeError(f"no Mihomo enrichment worker started: {detail}")
+        self.checks = set(self._workers[0].checks)
+        return self
+
+    def __exit__(self, *args):
+        if self._stack:
+            self._stack.__exit__(*args)
+            self._stack = None
+        self._workers = []
+
+    def enrich(
+        self, values: list[Measurement],
+        progress: Callable[[int, int, Measurement, str], None] | None = None,
+    ) -> None:
+        if not self._workers:
+            raise RuntimeError("Mihomo enrichment pool is not running")
+        if len(self._workers) == 1 or len(values) <= 1:
+            self._workers[0].enrich(values, progress)
+            return
+
+        chunks = [values[index::len(self._workers)] for index in range(len(self._workers))]
+        counters = {"start": 0, "finish": 0}
+        lock = Lock()
+
+        def pooled_progress(_index: int, _count: int, item: Measurement, phase: str) -> None:
+            if not progress:
+                return
+            with lock:
+                key = "start" if phase == "start" else "finish"
+                counters[key] += 1
+                index = counters[key]
+                progress(index, len(values), item, phase)
+
+        with ThreadPoolExecutor(
+            max_workers=len(self._workers), thread_name_prefix="clashbench-enrichment",
+        ) as executor:
+            futures = [
+                executor.submit(worker.enrich, chunk, pooled_progress)
+                for worker, chunk in zip(self._workers, chunks)
+                if chunk
+            ]
+            for future in futures:
+                future.result()

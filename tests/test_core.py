@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import contextlib
 import io
+import json
+import plistlib
 import re
 import sqlite3
 import subprocess
@@ -12,14 +14,17 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 from clashbench.config import Provider, Settings, load_config
 from clashbench.cli import main as cli_main
 from clashbench.db import (
     add_measurements, begin_run, connect, finish_run, rotated_providers,
 )
 from clashbench.engine import FaceairAdapter, Measurement, materialize_provider, parse_faceair_tsv, subscription_format
-from clashbench.enrich import MihomoEnricher, classify_chatgpt_response
+from clashbench.enrich import MihomoEnricher, MihomoEnricherPool, classify_chatgpt_response
 from clashbench.environment import capture_network_environment
+from clashbench.notifications import notification_text, send_macos_notification
 from clashbench.profile import benchmark_profile
 from clashbench.regions import classify_region, region_filter_regex
 from clashbench.report import (
@@ -79,6 +84,19 @@ source_env = "DEMO_URL"
 timezone = "Not/A-Timezone"
 """, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Unknown report.timezone"):
+                load_config(path)
+
+    def test_config_validates_enrichment_workers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bench.toml"
+            path.write_text("""
+[[providers]]
+name = "demo"
+source_env = "DEMO_URL"
+[enrichment]
+workers = 0
+""", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "enrichment.workers"):
                 load_config(path)
 
     def test_parser_and_units(self):
@@ -299,6 +317,54 @@ timezone = "Not/A-Timezone"
             enricher = MihomoEnricher("missing", Path("/tmp/unused"), Path("/tmp/unused.yaml"))
         self.assertEqual((enricher.mixed_port, enricher.controller_port), (18080, 19090))
 
+    def test_mihomo_worker_drops_unused_rules_from_temporary_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.yaml"
+            source.write_text("""
+proxies:
+  - {name: demo, type: ss, server: 127.0.0.1, port: 1, cipher: aes-128-gcm, password: test}
+rules:
+  - GEOIP,CN,DIRECT
+rule-providers:
+  demo: {type: http, url: https://example.invalid/rules.yaml}
+""", encoding="utf-8")
+            process = MagicMock()
+            process.poll.return_value = None
+            with patch("clashbench.enrich._free_port", side_effect=[18080, 19090]), \
+                 patch("clashbench.enrich.subprocess.Popen", return_value=process), \
+                 patch.object(MihomoEnricher, "_api", return_value={}):
+                with MihomoEnricher("/bin/echo", root, source):
+                    generated = yaml.safe_load((root / "mihomo/config.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(generated["rules"], [])
+            self.assertEqual(generated["rule-providers"], {})
+
+    def test_mihomo_pool_partitions_nodes_across_isolated_workers(self):
+        workers = [MagicMock(), MagicMock()]
+        chunks = []
+        for worker in workers:
+            worker.__enter__.return_value = worker
+            worker.checks = {"chatgpt"}
+
+            def enrich(values, progress, *, _worker=worker):
+                chunks.append([item.node_name for item in values])
+                for index, item in enumerate(values, 1):
+                    progress(index, len(values), item, "start")
+                    progress(index, len(values), item, "done")
+
+            worker.enrich.side_effect = enrich
+        values = [measurement("a", f"n{index}") for index in range(4)]
+        phases = []
+        with patch("clashbench.enrich.MihomoEnricher", side_effect=workers):
+            with MihomoEnricherPool(
+                "mihomo", Path("/tmp/runtime"), Path("/tmp/config"), workers=2,
+            ) as pool:
+                self.assertEqual(pool.active_workers, 2)
+                pool.enrich(values, lambda index, total, item, phase: phases.append((index, total, phase)))
+        self.assertCountEqual(chunks, [["n0", "n2"], ["n1", "n3"]])
+        self.assertEqual(sum(phase == "start" for _, _, phase in phases), 4)
+        self.assertEqual(sum(phase == "done" for _, _, phase in phases), 4)
+
     def test_infrastructure_diversity_uses_latest_per_node(self):
         with tempfile.TemporaryDirectory() as temp:
             conn = connect(Path(temp) / "bench.db")
@@ -326,8 +392,15 @@ timezone = "Not/A-Timezone"
             reports = write_reports(conn, root / "reports", 7, run)
             self.assertTrue(all(path.exists() for path in reports.values()))
             self.assertIn("n=1", reports["latest_md"].read_text())
-            plist = launch_agent(root / "bench.toml", root, ["09:00", "00:00"])
+            plist = launch_agent(
+                root / "bench.toml", root, ["09:00", "00:00"], regions="JP,SG,US",
+            )
             self.assertIn(b"StartCalendarInterval", plist)
+            payload = plistlib.loads(plist)
+            self.assertEqual(payload["ProgramArguments"][:2], ["/usr/bin/caffeinate", "-i"])
+            self.assertIn("--quick", payload["ProgramArguments"])
+            self.assertEqual(payload["ProgramArguments"][-2:], ["--regions", "JP,SG,US"])
+            self.assertEqual(payload["ProcessType"], "Standard")
             conn.close()
 
         outputs = {
@@ -340,6 +413,30 @@ timezone = "Not/A-Timezone"
         self.assertTrue(env["system_proxy"]["http_enabled"])
         self.assertEqual(env["default_interface"], "en0")
         self.assertEqual(env["tunnel_interfaces_active"], ["utun2"])
+
+    def test_native_notification_summarizes_chatgpt_by_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            conn = connect(Path(temp) / "bench.db")
+            run = begin_run(conn, "a", "mock", ["JP"], comparison_key="p")
+            first = measurement("alpha", "one")
+            first.chatgpt = "available:JP"
+            second = measurement("alpha", "two")
+            second.chatgpt = "challenge:JP"
+            third = measurement("beta", "three")
+            third.chatgpt = "available:US"
+            add_measurements(conn, run, [first, second, third])
+            finish_run(conn, run, "ok")
+            title, subtitle, message = notification_text(conn, run, "ok")
+            self.assertEqual(title, "Clash Bench：ChatGPT 2/3 可用")
+            self.assertEqual(subtitle, "评测完成")
+            self.assertIn("alpha 1/2", message)
+            self.assertIn("beta 1/1", message)
+            conn.close()
+
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("clashbench.notifications.subprocess.run", return_value=completed) as run_command:
+            send_macos_notification("title", "subtitle", "message")
+        self.assertEqual(run_command.call_args.args[0][0], "/usr/bin/osascript")
 
     def test_mock_cli_creates_independent_and_trend_reports(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -363,7 +460,7 @@ timezone = "Asia/Shanghai"
 """, encoding="utf-8")
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                self.assertEqual(cli_main(["run", "--config", str(config), "--mock"]), 0)
+                self.assertEqual(cli_main(["run", "--config", str(config), "--mock", "--quick"]), 0)
             self.assertIn("[run] 开始", output.getvalue())
             self.assertIn("[1/2 alpha] 生成 mock 测试数据", output.getvalue())
             self.assertIn("[report] 生成", output.getvalue())
@@ -374,6 +471,7 @@ timezone = "Asia/Shanghai"
             conn = connect(root / "data/bench.sqlite3")
             run = conn.execute("SELECT * FROM runs").fetchone()
             self.assertTrue(run["comparison_key"])
+            self.assertEqual(json.loads(run["parameters_json"])["speed_mode"], "fast")
             self.assertEqual(len(conn.execute("SELECT * FROM provider_runs").fetchall()), 2)
             run_id = run["id"]
             conn.close()

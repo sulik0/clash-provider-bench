@@ -51,6 +51,7 @@ clashbench doctor --config examples/bench.toml
 ```bash
 clashbench run --config examples/bench.toml
 clashbench run --config examples/bench.toml --regions JP,HK
+clashbench run --config examples/bench.toml --quick
 ```
 
 不访问真实订阅的演练：
@@ -67,11 +68,20 @@ clashbench export --config examples/bench.toml
 clashbench report --config examples/bench.toml --run-id <run-id>
 ```
 
-安装或移除 macOS 定时任务：
+安装或移除 macOS 定时任务。锁屏且 Mac 保持唤醒时会按时运行，睡眠期间错过的时刻会在下次唤醒时合并补跑一次：
 
 ```bash
-clashbench schedule install --config examples/bench.toml
+clashbench schedule install --config examples/bench.toml --regions JP,SG,US
+# 如需定时运行完整下载测速，而不是默认的快速可用性检查：
+clashbench schedule install --config examples/bench.toml --full
 clashbench schedule uninstall --config examples/bench.toml
+```
+
+发送一条测试通知，或重新发送最近一次评测摘要：
+
+```bash
+clashbench notify --config examples/bench.toml --test
+clashbench notify --config examples/bench.toml
 ```
 
 默认输出位于：

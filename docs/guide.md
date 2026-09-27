@@ -68,8 +68,11 @@ path = "./private/provider.yaml"
 | `enrichment.enabled` | 启动隔离 Mihomo，获取出口 IP、国家、地区、ASN 和组织。 |
 | `enrichment.unlock` | 是否执行配置的服务可用性检测。 |
 | `enrichment.checks` | 只检测指定服务，例如 `["chatgpt"]`；可选值为 ChatGPT、YouTube、Netflix。 |
+| `enrichment.workers` | 附加检测并行 worker 数；每个 worker 使用独立 Mihomo 进程，范围 1～16。 |
 | `enrichment.chatgpt_unsupported_countries` | 按实际出口国家标记已知不支持地区；建议根据 OpenAI 官方列表维护。 |
 | `report.timezone` | 报告展示、文件命名、日间和晚高峰分桶使用的 IANA 时区；示例固定为 `Asia/Shanghai`。 |
+| `notification.enabled` | 每次真实评测完成后发送原生 macOS 通知。 |
+| `notification.mode` | 当前支持 `macos`，通知包含总 ChatGPT 可用数及各 provider 分项。 |
 
 ### ChatGPT 优先的推荐参数
 
@@ -87,12 +90,21 @@ progress_interval_seconds = 5
 [enrichment]
 enabled = true
 timeout_seconds = 15
+workers = 4
 unlock = true
 checks = ["chatgpt"]
 chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 ```
 
-这套参数用 5 MB 下载提供粗粒度线路质量信号，同时避免对几十个节点逐一进行大流量测速；并发 2 和 15 秒超时对远距离线路更宽容。上传大小在 `download` 模式下不会使用。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 仍可保留在测试列表中，作为识别实际出口和地区限制的对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
+这套参数用 5 MB 下载提供粗粒度线路质量信号，同时避免对几十个节点逐一进行大流量测速；并发 2 和 15 秒超时对远距离线路更宽容。上传大小在 `download` 模式下不会使用。附加检测使用 4 个独立 Mihomo worker 并行处理，不共享 `GLOBAL` 选择器、连接池或 Cookie；这通常能让出口和 ChatGPT 检测阶段接近原来的四分之一，但实际耗时仍取决于超时节点比例。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 仍可保留在测试列表中，作为识别实际出口和地区限制的对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
+
+如果本次目的只是尽快判断哪些节点能访问 ChatGPT，可使用：
+
+```bash
+clashbench run --config examples/bench.toml --quick
+```
+
+快速模式把本次运行的 `speed_mode` 独立改为 `fast`，保留节点延迟、抖动、丢包、出口和 ChatGPT 检测，但跳过逐节点下载/上传。它会获得独立的对比条件 ID，不会和完整吞吐评测混合。完整 `run` 仍按配置执行下载测速，适合观察带宽、CV 和晚高峰衰减。
 
 ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹访问主站及一个无需登录即可返回认证状态的后端端点，并结合实际出口国家和 Cloudflare 响应分类。每个节点使用独立会话，避免节点切换后复用上一个出口的连接或 Cookie：
 
@@ -148,6 +160,7 @@ ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹访问主站�
 - 下载/上传大小、并发和超时
 - 地区集合
 - enrichment/unlock 开关
+- enrichment 并行 worker 数
 - macOS 版本和 CPU 架构
 - 默认网络接口
 - 系统代理启用类型和代理服务器哈希
@@ -215,7 +228,19 @@ sqlite3 data/bench.sqlite3 ".backup 'data/bench.backup.sqlite3'"
 
 ## 定时任务说明
 
-`launchd` 保存的是安装日程时使用的 Python 解释器，因此应先激活项目 `.venv`。Mac 睡眠时错过的固定时刻通常不会补跑；需要时可唤醒后手动补跑。
+`launchd` 保存的是安装日程时使用的 Python 解释器，因此应先激活项目 `.venv`。锁屏不会阻止当前用户的 LaunchAgent，只要用户仍处于登录状态且 Mac 没有睡眠，任务会正常按时启动。任务通过 `caffeinate -i` 运行，一旦开始就会阻止空闲睡眠，直到测速完成。
+
+定时任务默认追加 `--quick`，优先快速得到 ChatGPT 可用性并发送通知。由于示例已经把 HK 配置为 ChatGPT 不支持地区，建议安装日程时使用 `--regions JP,SG,US` 跳过 HK，进一步减少约三成节点检查。需要定时收集完整下载速度时使用 `clashbench schedule install --config examples/bench.toml --full`；这会覆盖现有日程。建议快速检查高频运行，完整吞吐评测降低到每天一两次。
+
+`StartCalendarInterval` 无法主动唤醒已经睡眠的 Mac，但 macOS 会在下次唤醒时补跑一次；睡眠期间错过多个时刻会合并成一次，不会连续补跑多次。若要求整点唤醒，需要额外配置系统唤醒日程，这不属于本工具默认行为。
+
+示例配置在每次真实评测完成后发送原生 macOS 通知，内容包括总 ChatGPT 可用节点数及各 provider 分项。先手动验证一次：
+
+```bash
+clashbench notify --config examples/bench.toml --test
+```
+
+通知在锁屏时会进入 macOS 通知中心；能否显示在锁定屏幕取决于“系统设置 → 通知”中的锁定屏幕显示权限。`run --mock` 不发送通知。通知发送失败只写入运行日志，不会把成功测速改成失败。
 
 中途修改测速参数或升级测速内核会开始新的趋势条件组，这是预期行为。
 

@@ -46,6 +46,7 @@ def benchmark_profile(
         "regions": sorted(set(regions)),
         "providers": sorted(provider.name for provider in settings.providers),
         "enrichment_enabled": bool(enrichment.get("enabled", False)),
+        "enrichment_workers": int(enrichment.get("workers", 1)),
         "unlock_enabled": unlock_enabled,
         "enrichment_checks": sorted(str(value).lower() for value in enrichment_checks),
         "chatgpt_unsupported_countries": sorted(

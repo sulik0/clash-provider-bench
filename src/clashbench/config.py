@@ -25,6 +25,7 @@ class Settings:
     engine: dict[str, Any]
     report: dict[str, Any] = field(default_factory=dict)
     enrichment: dict[str, Any] = field(default_factory=dict)
+    notification: dict[str, Any] = field(default_factory=dict)
     region_patterns: dict[str, list[str]] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -69,6 +70,15 @@ def load_config(path: str | Path) -> Settings:
     unsupported = enrichment.get("chatgpt_unsupported_countries", [])
     if not isinstance(unsupported, list) or not all(isinstance(value, str) and len(value) == 2 for value in unsupported):
         raise ValueError("enrichment.chatgpt_unsupported_countries must contain two-letter country codes")
+    workers = int(enrichment.get("workers", 1))
+    if not 1 <= workers <= 16:
+        raise ValueError("enrichment.workers must be between 1 and 16")
+    enrichment["workers"] = workers
+    notification = dict(raw.get("notification", {}))
+    notification_mode = str(notification.get("mode", "macos")).lower()
+    if notification_mode not in {"macos"}:
+        raise ValueError(f"Unknown notification.mode: {notification_mode}")
+    notification["mode"] = notification_mode
     report = dict(raw.get("report", {}))
     timezone_name = str(report.get("timezone", "Asia/Shanghai"))
     try:
@@ -85,6 +95,7 @@ def load_config(path: str | Path) -> Settings:
         engine=engine,
         report=report,
         enrichment=enrichment,
+        notification=notification,
         region_patterns={k.upper(): list(v) for k, v in raw.get("region_patterns", {}).items()},
         raw=raw,
     )

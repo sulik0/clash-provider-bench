@@ -13,11 +13,12 @@ from zoneinfo import ZoneInfo
 from .config import load_config
 from .db import (
     add_measurements, begin_provider, begin_run, connect, export_csv, finish_provider,
-    finish_run, rotated_providers,
+    finish_run, latest_run_id, rotated_providers,
 )
 from .engine import FaceairAdapter, materialize_provider, parse_faceair_tsv, write_mock_tsv
-from .enrich import MihomoEnricher
+from .enrich import MihomoEnricherPool
 from .environment import capture_network_environment
+from .notifications import notify_run, send_macos_notification
 from .profile import benchmark_profile
 from .report import since_iso, write_reports
 from .schedule import LABEL, launch_agent
@@ -33,14 +34,23 @@ def _parser() -> argparse.ArgumentParser:
         if name == "run":
             cmd.add_argument("--regions", help="Comma-separated override, e.g. JP,HK")
             cmd.add_argument("--mock", action="store_true", help="Store deterministic fixtures; no network or real test")
+            cmd.add_argument(
+                "--quick", action="store_true",
+                help="Skip download/upload throughput and prioritize availability/ChatGPT checks",
+            )
     report = sub.add_parser("report")
     report.add_argument("--config", default="bench.toml"); report.add_argument("--days", type=int, default=7); report.add_argument("--output", default="reports")
     report.add_argument("--run-id", help="Regenerate the single-run report for this run and anchor its trend")
     export = sub.add_parser("export")
     export.add_argument("--config", default="bench.toml"); export.add_argument("--days", type=int, default=7); export.add_argument("--output", default="reports/results.csv")
+    notify = sub.add_parser("notify")
+    notify.add_argument("--config", default="bench.toml")
+    notify.add_argument("--test", action="store_true", help="Send a test notification instead of the latest run summary")
     schedule = sub.add_parser("schedule")
     schedule.add_argument("action", choices=("render", "install", "uninstall")); schedule.add_argument("--config", default="bench.toml")
     schedule.add_argument("--times", default="09:00,14:00,20:00,22:00,00:00"); schedule.add_argument("--output")
+    schedule.add_argument("--full", action="store_true", help="Schedule full throughput tests instead of the default quick checks")
+    schedule.add_argument("--regions", help="Comma-separated region override for scheduled runs")
     return p
 
 
@@ -56,6 +66,8 @@ def cmd_run(args) -> int:
     load_dotenv(config_path.parent / ".env")
     settings = load_config(config_path)
     timezone_name = str(settings.report.get("timezone", "Asia/Shanghai"))
+    if args.quick:
+        settings.engine["speed_mode"] = "fast"
 
     def progress(prefix: str, message: str, *, file=None) -> None:
         _progress(prefix, message, timezone_name, file=file)
@@ -80,10 +92,13 @@ def cmd_run(args) -> int:
     )
     runtime = settings.root / ".runtime" / run_id
     errors, total = [], 0
-    progress("run", f"开始 {run_id}；Provider 顺序：{' → '.join(provider_order)}")
+    mode = "快速可用性检查" if args.quick else "完整配置评测"
+    progress("run", f"开始 {run_id}；模式：{mode}；Provider 顺序：{' → '.join(provider_order)}")
+    active_provider: str | None = None
     try:
         for ordinal, provider_name in enumerate(provider_order):
             provider = providers_by_name[provider_name]
+            active_provider = provider.name
             prefix = f"{ordinal + 1}/{len(provider_order)} {provider.name}"
             begin_provider(conn, run_id, provider.name, ordinal)
             try:
@@ -102,13 +117,28 @@ def cmd_run(args) -> int:
                             mihomo_binary = str(settings.enrichment.get("mihomo_binary", "mihomo"))
                             if "/" in mihomo_binary:
                                 mihomo_binary = str((settings.root / mihomo_binary).resolve())
-                            with MihomoEnricher(mihomo_binary, runtime, config,
-                                                bool(settings.enrichment.get("unlock", False)),
-                                                int(settings.enrichment.get("timeout_seconds", 15)),
-                                                settings.enrichment.get("checks"),
-                                                settings.enrichment.get("chatgpt_unsupported_countries", ())) as enricher:
+                            configured_workers = int(settings.enrichment.get("workers", 1))
+                            worker_count = min(configured_workers, max(1, sum(item.available for item in values)))
+                            with MihomoEnricherPool(
+                                mihomo_binary, runtime, config,
+                                bool(settings.enrichment.get("unlock", False)),
+                                int(settings.enrichment.get("timeout_seconds", 15)),
+                                settings.enrichment.get("checks"),
+                                settings.enrichment.get("chatgpt_unsupported_countries", ()),
+                                worker_count,
+                            ) as enricher:
                                 checks = ",".join(sorted(enricher.checks)) or "仅出口信息"
-                                progress(prefix, f"开始逐节点附加检测：{len(values)} 个节点；项目={checks}")
+                                progress(
+                                    prefix,
+                                    f"开始逐节点附加检测：{len(values)} 个节点；项目={checks}；"
+                                    f"并行 worker={enricher.active_workers}",
+                                )
+                                if enricher.startup_errors:
+                                    progress(
+                                        prefix,
+                                        f"部分 worker 启动失败，已降级为 {enricher.active_workers} 个",
+                                        file=sys.stderr,
+                                    )
 
                                 def enrichment_progress(index, count, item, phase):
                                     name = " ".join(item.node_name.split())[:60]
@@ -136,8 +166,14 @@ def cmd_run(args) -> int:
                 errors.append(f"{provider.name}: {message}")
                 finish_provider(conn, run_id, provider.name, "failed", 0, message)
                 progress(prefix, f"failed: {message}", file=sys.stderr)
+            active_provider = None
         status = "partial" if errors and total else "failed" if errors else "ok"
         finish_run(conn, run_id, status, " | ".join(errors) or None)
+    except KeyboardInterrupt:
+        if active_provider:
+            finish_provider(conn, run_id, active_provider, "failed", 0, "interrupted")
+        finish_run(conn, run_id, "failed", "interrupted")
+        raise
     finally:
         shutil.rmtree(runtime, ignore_errors=True)
     out_dir = settings.root / settings.report.get("output", "reports")
@@ -146,6 +182,17 @@ def cmd_run(args) -> int:
         conn, out_dir, int(settings.report.get("days", 7)), run_id, timezone_name,
     )
     export_csv(conn, out_dir / "results.csv")
+    if settings.notification.get("enabled", False) and not args.mock:
+        try:
+            notify_run(
+                conn, run_id, status,
+                str(settings.notification.get("mode", "macos")),
+            )
+            progress("notification", "已发送本次 ChatGPT/节点可用性摘要")
+        except Exception as exc:
+            progress(
+                "notification", f"发送失败：{type(exc).__name__}", file=sys.stderr,
+            )
     print(f"run={run_id} status={'partial' if errors and total else 'failed' if errors else 'ok'} rows={total}")
     print(f"report={reports['run_md']}\ntrend={reports['trend_html']}")
     conn.close()
@@ -173,10 +220,16 @@ def cmd_doctor(args) -> int:
         if not settings.enrichment.get("unlock"):
             checks = []
         print(f"{'OK' if found else 'MISSING'} Mihomo: {candidate if candidate.is_file() else configured}")
-        print(f"OK enrichment: checks={','.join(checks) or 'egress-only'}; timeout={int(settings.enrichment.get('timeout_seconds', 15))}s")
+        print(
+            f"OK enrichment: checks={','.join(checks) or 'egress-only'}; "
+            f"timeout={int(settings.enrichment.get('timeout_seconds', 15))}s; "
+            f"workers={int(settings.enrichment.get('workers', 1))}"
+        )
         if not found:
             ok = False
     print(f"OK report timezone: {settings.report.get('timezone', 'Asia/Shanghai')}")
+    state = "enabled" if settings.notification.get("enabled", False) else "disabled"
+    print(f"OK notification: {state}; mode={settings.notification.get('mode', 'macos')}")
     return 0 if ok else 1
 
 
@@ -195,6 +248,29 @@ def cmd_export(args) -> int:
     print(f"exported {count} rows"); conn.close(); return 0
 
 
+def cmd_notify(args) -> int:
+    settings = load_config(args.config)
+    if args.test:
+        send_macos_notification(
+            "Clash Bench 通知测试", "macOS 定时通知已就绪",
+            "锁屏时通知会进入通知中心；机器睡眠时将在唤醒后显示。",
+        )
+        print("test notification sent")
+        return 0
+    conn = connect(settings.database)
+    run_id = latest_run_id(conn)
+    if not run_id:
+        conn.close()
+        raise ValueError("No completed runs are available for notification")
+    run = conn.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+    title, subtitle, message = notify_run(
+        conn, run_id, run["status"], str(settings.notification.get("mode", "macos")),
+    )
+    conn.close()
+    print(f"{title} | {subtitle} | {message}")
+    return 0
+
+
 def cmd_schedule(args) -> int:
     config = Path(args.config).expanduser().resolve(); project = config.parent
     target = Path(args.output).expanduser().resolve() if args.output else Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
@@ -202,7 +278,10 @@ def cmd_schedule(args) -> int:
         if target.exists(): target.unlink()
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], check=False, capture_output=True)
         print(f"removed {target}"); return 0
-    content = launch_agent(config, project, [x.strip() for x in args.times.split(",")])
+    content = launch_agent(
+        config, project, [x.strip() for x in args.times.split(",")],
+        quick=not args.full, regions=args.regions,
+    )
     if args.action == "render":
         target = Path(args.output or project / "data" / f"{LABEL}.plist").resolve()
     target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(content)
@@ -214,7 +293,10 @@ def cmd_schedule(args) -> int:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
-    return {"run": cmd_run, "doctor": cmd_doctor, "report": cmd_report, "export": cmd_export, "schedule": cmd_schedule}[args.command](args)
+    return {
+        "run": cmd_run, "doctor": cmd_doctor, "report": cmd_report,
+        "export": cmd_export, "notify": cmd_notify, "schedule": cmd_schedule,
+    }[args.command](args)
 
 
 if __name__ == "__main__":
