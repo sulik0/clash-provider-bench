@@ -93,13 +93,15 @@ chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 
 这套参数用 5 MB 下载提供粗粒度线路质量信号，同时避免对几十个节点逐一进行大流量测速；并发 2 和 15 秒超时对远距离线路更宽容。上传大小在 `download` 模式下不会使用。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 仍可保留在测试列表中，作为识别实际出口和地区限制的对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
 
-ChatGPT 检测使用与浏览器相近的请求访问主站及一个无需登录即可返回认证状态的后端端点，并结合实际出口国家和 Cloudflare 响应分类：
+ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹访问主站及一个无需登录即可返回认证状态的后端端点，并结合实际出口国家和 Cloudflare 响应分类。每个节点使用独立会话，避免节点切换后复用上一个出口的连接或 Cookie：
 
 - `available`：未登录主页请求成功。
 - `unsupported-country`：实际出口位于配置的非支持地区，或响应明确表示地区不支持。
 - `challenge`：Cloudflare 要求挑战；这类出口可能在浏览器偶尔可用，但 CLI、桌面应用或长连接通常不够稳定。
 - `blocked`：明确返回阻断响应。
 - `rate-limited` / `http-*` / `error`：限流、异常 HTTP 响应或网络错误。
+
+不能用普通 Python `urllib` 的响应直接判断 ChatGPT：它的 TLS 指纹可能让所有正常出口都收到 `Cf-Mitigated: challenge`，从而产生系统性假阴性。探测客户端及其版本会写入 `comparison_key`，更换客户端后旧结果不会和新结果混合统计。
 
 检测不读取账号、Cookie 或 token，因此 `available` 代表节点具备未登录网络访问条件，不保证账号登录、工作区 IP 白名单或对话请求一定成功。OpenAI 官方也说明 ChatGPT 会使用主站、认证、静态资源和 WebSocket 等多个域名；完整网络要求见其[网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
 

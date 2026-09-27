@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 import certifi
+from curl_cffi import requests as browser_requests
 
 from .engine import Measurement
 from .util import ensure_private_file
@@ -85,7 +86,10 @@ class MihomoEnricher:
         self.chatgpt_unsupported_countries = {
             str(value).upper() for value in chatgpt_unsupported_countries
         }
-        self.mixed_port, self.controller_port = _free_port(), _free_port()
+        self.mixed_port = _free_port()
+        self.controller_port = _free_port()
+        while self.controller_port == self.mixed_port:
+            self.controller_port = _free_port()
         self.secret = secrets.token_urlsafe(24)
         self.process: subprocess.Popen | None = None
 
@@ -142,7 +146,20 @@ class MihomoEnricher:
             with opener.open(request, timeout=self.timeout) as response:
                 return response.status, response.read(limit), dict(response.headers.items())
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(limit), dict(exc.headers.items())
+            return exc.code, exc.read(limit), dict(exc.headers.items()) if exc.headers else {}
+
+    def _browser_proxied(
+        self, url: str, limit: int, session: browser_requests.Session,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        """Request through Mihomo with a real Chrome TLS/HTTP2 fingerprint."""
+        proxy = f"http://127.0.0.1:{self.mixed_port}"
+        response = session.get(
+            url, proxy=proxy, timeout=self.timeout, allow_redirects=True,
+        )
+        try:
+            return response.status_code, response.content[:limit], dict(response.headers.items())
+        finally:
+            response.close()
 
     def enrich(
         self, values: list[Measurement],
@@ -217,38 +234,47 @@ class MihomoEnricher:
                 progress(index, total, item, "done")
 
     def _chatgpt(self, location: str | None = None) -> str:
-        if not location:
-            trace_status, trace_raw, _ = self._proxied("https://chatgpt.com/cdn-cgi/trace", 64_000)
-            if trace_status == 200:
-                trace = trace_raw.decode("utf-8", "replace")
-                location = next((line.split("=", 1)[1] for line in trace.splitlines() if line.startswith("loc=")), "")
-        status, raw, headers = self._proxied("https://chatgpt.com/", 256_000)
-        homepage = classify_chatgpt_response(
-            status, raw, headers, location, self.chatgpt_unsupported_countries,
-        )
-        if not homepage.startswith("available"):
-            return homepage
+        # A fresh session per node prevents cookies and pooled proxy connections
+        # from leaking across a GLOBAL selector change. The two requests for one
+        # node intentionally share a session, matching normal browser behavior.
+        session = browser_requests.Session(impersonate="chrome")
+        try:
+            if not location:
+                trace_status, trace_raw, _ = self._browser_proxied(
+                    "https://chatgpt.com/cdn-cgi/trace", 64_000, session,
+                )
+                if trace_status == 200:
+                    trace = trace_raw.decode("utf-8", "replace")
+                    location = next((line.split("=", 1)[1] for line in trace.splitlines() if line.startswith("loc=")), "")
+            status, raw, headers = self._browser_proxied("https://chatgpt.com/", 256_000, session)
+            homepage = classify_chatgpt_response(
+                status, raw, headers, location, self.chatgpt_unsupported_countries,
+            )
+            if not homepage.startswith("available"):
+                return homepage
 
-        # A page shell can load even when the ChatGPT backend is challenged. An
-        # unauthenticated backend response (normally 401/403) proves reachability
-        # without using account cookies or treating authentication failure as a block.
-        backend_status, backend_raw, backend_headers = self._proxied(
-            "https://chatgpt.com/backend-api/me", 64_000,
-        )
-        backend = classify_chatgpt_response(
-            backend_status, backend_raw, backend_headers, location,
-            self.chatgpt_unsupported_countries,
-        )
-        backend_text = backend_raw.decode("utf-8", "replace").lower()
-        if backend.startswith(("challenge", "unsupported-country", "rate-limited")):
-            return backend
-        if backend.startswith("blocked") and any(marker in backend_text for marker in (
-            "sorry, you have been blocked", "access denied", "you are unable to access chatgpt.com",
-        )):
-            return backend
-        if backend_status >= 500:
-            return f"backend-http-{backend_status}{':' + location.upper() if location else ''}"
-        return homepage
+            # A page shell can load even when the ChatGPT backend is challenged. An
+            # unauthenticated backend response (normally 401/403) proves reachability
+            # without using account cookies or treating authentication failure as a block.
+            backend_status, backend_raw, backend_headers = self._browser_proxied(
+                "https://chatgpt.com/backend-api/me", 64_000, session,
+            )
+            backend = classify_chatgpt_response(
+                backend_status, backend_raw, backend_headers, location,
+                self.chatgpt_unsupported_countries,
+            )
+            backend_text = backend_raw.decode("utf-8", "replace").lower()
+            if backend.startswith(("challenge", "unsupported-country", "rate-limited")):
+                return backend
+            if backend.startswith("blocked") and any(marker in backend_text for marker in (
+                "sorry, you have been blocked", "access denied", "you are unable to access chatgpt.com",
+            )):
+                return backend
+            if backend_status >= 500:
+                return f"backend-http-{backend_status}{':' + location.upper() if location else ''}"
+            return homepage
+        finally:
+            session.close()
 
     def _simple_unlock(self, url: str) -> str:
         status, _, _ = self._proxied(url, 128_000)

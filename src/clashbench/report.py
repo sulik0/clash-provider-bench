@@ -291,11 +291,13 @@ def _conditions(run: sqlite3.Row) -> list[str]:
     proxy = env.get("system_proxy", {})
     enabled = [name.removesuffix("_enabled") for name, value in proxy.items() if name.endswith("_enabled") and value]
     checks = params.get("enrichment_checks", [])
+    chatgpt_probe = params.get("chatgpt_probe") or {}
     return [
         f"- 对比条件 ID：`{run['comparison_key'] or 'legacy:' + run['config_digest']}`",
         f"- 引擎：{run['engine_version'] or run['engine']}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
         f"- 文件大小：下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
         f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
+        f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
         f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
         f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
     ]

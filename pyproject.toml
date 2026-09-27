@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clash-provider-bench"
-version = "0.3.0"
+version = "0.3.1"
 description = "Reproducible Clash/Mihomo provider benchmarking orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6.0.1", "certifi>=2025.1.31"]
+dependencies = ["PyYAML>=6.0.1", "certifi>=2025.1.31", "curl_cffi>=0.14,<1"]
 license = {text = "MIT"}
 
 [project.scripts]

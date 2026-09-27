@@ -253,16 +253,21 @@ checks = ["chatgpt", "not-a-service"]
                 "missing", Path("/tmp/unused"), Path("/tmp/unused.yaml"),
                 unlock=True, checks=["chatgpt"],
             )
-        with patch.object(enricher, "_proxied", side_effect=[
+        with patch.object(enricher, "_browser_proxied", side_effect=[
             (200, b"homepage", {}),
             (403, b'{"detail":"authentication required"}', {}),
         ]):
             self.assertEqual(enricher._chatgpt("US"), "available:US")
-        with patch.object(enricher, "_proxied", side_effect=[
+        with patch.object(enricher, "_browser_proxied", side_effect=[
             (200, b"homepage", {}),
             (403, b"challenge", {"Cf-Mitigated": "challenge"}),
         ]):
             self.assertEqual(enricher._chatgpt("JP"), "challenge:JP")
+
+    def test_mihomo_ports_are_distinct(self):
+        with patch("clashbench.enrich._free_port", side_effect=[18080, 18080, 19090]):
+            enricher = MihomoEnricher("missing", Path("/tmp/unused"), Path("/tmp/unused.yaml"))
+        self.assertEqual((enricher.mixed_port, enricher.controller_port), (18080, 19090))
 
     def test_infrastructure_diversity_uses_latest_per_node(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -6,6 +6,8 @@ import platform
 import urllib.parse
 from typing import Any
 
+import curl_cffi
+
 from .config import Settings
 
 
@@ -49,6 +51,10 @@ def benchmark_profile(
         "chatgpt_unsupported_countries": sorted(
             str(value).upper() for value in enrichment.get("chatgpt_unsupported_countries", [])
         ) if "chatgpt" in {str(value).lower() for value in enrichment_checks} else [],
+        "chatgpt_probe": {
+            "client": "curl_cffi", "version": curl_cffi.__version__, "impersonate": "chrome",
+            "endpoints": ["homepage", "backend-api/me"],
+        } if "chatgpt" in {str(value).lower() for value in enrichment_checks} else None,
         "platform": platform.system(),
         "machine": platform.machine(),
         "os_version": platform.mac_ver()[0] or platform.release(),
