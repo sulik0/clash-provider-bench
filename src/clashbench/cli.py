@@ -282,6 +282,7 @@ def cmd_schedule(args) -> int:
         config, project, [x.strip() for x in args.times.split(",")],
         quick=not args.full, regions=args.regions,
     )
+    (project / "data").mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.action == "render":
         target = Path(args.output or project / "data" / f"{LABEL}.plist").resolve()
     target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(content)

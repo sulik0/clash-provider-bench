@@ -484,6 +484,23 @@ timezone = "Asia/Shanghai"
             self.assertIn("+08:00（Asia/Shanghai）", latest)
             self.assertIn("评测时区：Asia/Shanghai", latest)
 
+    def test_schedule_render_creates_launchd_log_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "bench.toml"
+            config.write_text("""
+[[providers]]
+name = "demo"
+source_env = "DEMO_URL"
+""", encoding="utf-8")
+            output = root / "agent.plist"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main([
+                    "schedule", "render", "--config", str(config), "--output", str(output),
+                ]), 0)
+            self.assertTrue((root / "data").is_dir())
+            self.assertTrue(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
