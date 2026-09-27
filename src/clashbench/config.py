@@ -5,6 +5,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass
@@ -68,6 +69,13 @@ def load_config(path: str | Path) -> Settings:
     unsupported = enrichment.get("chatgpt_unsupported_countries", [])
     if not isinstance(unsupported, list) or not all(isinstance(value, str) and len(value) == 2 for value in unsupported):
         raise ValueError("enrichment.chatgpt_unsupported_countries must contain two-letter country codes")
+    report = dict(raw.get("report", {}))
+    timezone_name = str(report.get("timezone", "Asia/Shanghai"))
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown report.timezone: {timezone_name}") from exc
+    report["timezone"] = timezone_name
     database = (root / raw.get("database", "data/bench.sqlite3")).resolve()
     return Settings(
         root=root,
@@ -75,7 +83,7 @@ def load_config(path: str | Path) -> Settings:
         providers=providers,
         regions=[str(x).upper() for x in raw.get("regions", [])],
         engine=engine,
-        report=dict(raw.get("report", {})),
+        report=report,
         enrichment=enrichment,
         region_patterns={k.upper(): list(v) for k, v in raw.get("region_patterns", {}).items()},
         raw=raw,

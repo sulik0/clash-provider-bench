@@ -55,6 +55,7 @@ def benchmark_profile(
             "client": "curl_cffi", "version": curl_cffi.__version__, "impersonate": "chrome",
             "endpoints": ["homepage", "backend-api/me"],
         } if "chatgpt" in {str(value).lower() for value in enrichment_checks} else None,
+        "evaluation_timezone": str(settings.report.get("timezone", "Asia/Shanghai")),
         "platform": platform.system(),
         "machine": platform.machine(),
         "os_version": platform.mac_ver()[0] or platform.release(),

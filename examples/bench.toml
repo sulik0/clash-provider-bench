@@ -47,6 +47,7 @@ chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 [report]
 output = "../reports"
 days = 7
+timezone = "Asia/Shanghai"
 
 # Override/add classification rules if your provider uses unusual names.
 # [region_patterns]

@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from .db import latest_run_id
 from .util import percentile
@@ -106,7 +107,11 @@ def _dimension_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
     return normalized.get(str(value).lower(), value)
 
 
-def summarize_rows(rows: Iterable[sqlite3.Row | dict[str, Any]], dimensions: tuple[str, ...]) -> list[dict[str, Any]]:
+def summarize_rows(
+    rows: Iterable[sqlite3.Row | dict[str, Any]], dimensions: tuple[str, ...],
+    timezone_name: str = "Asia/Shanghai",
+) -> list[dict[str, Any]]:
+    timezone = ZoneInfo(timezone_name)
     groups: dict[tuple[Any, ...], list[Any]] = defaultdict(list)
     for row in rows:
         groups[tuple(_dimension_value(row, key) for key in dimensions)].append(row)
@@ -121,9 +126,9 @@ def summarize_rows(rows: Iterable[sqlite3.Row | dict[str, Any]], dimensions: tup
         download = [row["download_mbps"] for row in available if row["download_mbps"] is not None]
         upload = [row["upload_mbps"] for row in available if row["upload_mbps"] is not None]
         evening = [row["download_mbps"] for row in available if row["download_mbps"] is not None
-                   and datetime.fromisoformat(row["tested_at"]).astimezone().hour in (20, 21, 22, 23)]
+                   and datetime.fromisoformat(row["tested_at"]).astimezone(timezone).hour in (20, 21, 22, 23)]
         daytime = [row["download_mbps"] for row in available if row["download_mbps"] is not None
-                   and datetime.fromisoformat(row["tested_at"]).astimezone().hour in (9, 14)]
+                   and datetime.fromisoformat(row["tested_at"]).astimezone(timezone).hour in (9, 14)]
         day_med, eve_med = percentile(daytime, .5), percentile(evening, .5)
         decline = None if day_med in (None, 0) or eve_med is None else (day_med - eve_med) / day_med * 100
         cv = None
@@ -232,13 +237,14 @@ def _trend_rows(conn: sqlite3.Connection, anchor: sqlite3.Row, days: int) -> tup
 
 def build_summary(
     conn: sqlite3.Connection, days: int = 7, run_id: str | None = None,
+    timezone_name: str = "Asia/Shanghai",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected = run_id or latest_run_id(conn)
     if not selected:
         return [], []
     run, current_rows = _run_and_rows(conn, selected)
     rows = current_rows if run_id else _trend_rows(conn, run, days)[0]
-    summary = summarize_rows(rows, ("provider", "region"))
+    summary = summarize_rows(rows, ("provider", "region"), timezone_name)
     return summary, find_anomalies(summary)
 
 
@@ -298,18 +304,21 @@ def _conditions(run: sqlite3.Row) -> list[str]:
         f"- 文件大小：下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
         f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
         f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
+        f"- 评测时区：{params.get('evaluation_timezone', 'Asia/Shanghai')}（数据库原始时间仍保存为 UTC）",
         f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
         f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
     ]
 
 
-def current_report(conn: sqlite3.Connection, run_id: str) -> str:
+def current_report(conn: sqlite3.Connection, run_id: str, timezone_name: str = "Asia/Shanghai") -> str:
     run, rows = _run_and_rows(conn, run_id)
+    timezone = ZoneInfo(timezone_name)
+    started_at = datetime.fromisoformat(run["started_at"]).astimezone(timezone).isoformat(timespec="seconds")
     provider_runs = conn.execute("SELECT * FROM provider_runs WHERE run_id=? ORDER BY ordinal", (run_id,)).fetchall()
-    regional = summarize_rows(rows, ("provider", "region"))
-    protocol = summarize_rows(rows, ("provider", "region", "proxy_type"))
+    regional = summarize_rows(rows, ("provider", "region"), timezone_name)
+    protocol = summarize_rows(rows, ("provider", "region", "proxy_type"), timezone_name)
     anomalies = find_anomalies(regional)
-    out = ["# Clash/Mihomo 单次评测报告", "", f"运行：`{run_id}`；开始：{run['started_at']}；状态：**{run['status']}**。", "",
+    out = ["# Clash/Mihomo 单次评测报告", "", f"运行：`{run_id}`；开始：{started_at}（{timezone_name}）；状态：**{run['status']}**。", "",
            "## 本次测试条件", "", *_conditions(run), "", "## Provider 执行状态", "",
            "| 顺序 | Provider | 状态 | 测量数 | 错误 |", "|---:|---|---|---:|---|"]
     if provider_runs:
@@ -329,11 +338,15 @@ def current_report(conn: sqlite3.Connection, run_id: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def trend_report(conn: sqlite3.Connection, run_id: str, days: int) -> str:
+def trend_report(
+    conn: sqlite3.Connection, run_id: str, days: int,
+    timezone_name: str = "Asia/Shanghai",
+) -> str:
     anchor, _ = _run_and_rows(conn, run_id)
+    timezone = ZoneInfo(timezone_name)
     rows, run_count, excluded = _trend_rows(conn, anchor, days)
-    regional = summarize_rows(rows, ("provider", "region"))
-    protocol = summarize_rows(rows, ("provider", "region", "proxy_type"))
+    regional = summarize_rows(rows, ("provider", "region"), timezone_name)
+    protocol = summarize_rows(rows, ("provider", "region", "proxy_type"), timezone_name)
     anomalies = find_anomalies(regional)
     profiles = conn.execute(
         """SELECT COALESCE(comparison_key,'legacy:'||config_digest||':'||engine) AS profile,
@@ -341,7 +354,7 @@ def trend_report(conn: sqlite3.Connection, run_id: str, days: int) -> str:
            FROM runs WHERE started_at>=? AND status!='running' GROUP BY profile ORDER BY runs DESC""",
         (since_iso(days),),
     ).fetchall()
-    out = [f"# Clash/Mihomo 最近 {days} 天趋势报告", "", f"生成时间：{datetime.now().astimezone().isoformat(timespec='seconds')}。", "",
+    out = [f"# Clash/Mihomo 最近 {days} 天趋势报告", "", f"生成时间：{datetime.now(timezone).isoformat(timespec='seconds')}（{timezone_name}）。", "",
            f"> 本报告只统计与锚点运行 `{run_id}` 对比条件完全一致且状态为 ok 的运行：{run_count} 次；另有 {excluded} 次因条件不同、旧格式、partial 或 failed 未混入统计。", "",
            "## 对比条件", "", *_conditions(anchor), "", "## Provider × 地区趋势", "",
            *_summary_table(regional, ("provider", "region")), "", "## Provider × 地区 × 协议趋势", "",
@@ -362,7 +375,7 @@ def _methodology() -> list[str]:
         "- 总样本是节点测量记录数。可用表示延迟探测成功且丢包低于 100%；测速成功还要求当前模式所需的吞吐阶段没有错误。测速成功率与失败率的分母始终是总样本，因此下载失败但延迟可用的节点会计入“可用”，同时计入“测速失败”。",
         "- 每个 P50/P95、CV 后的 `n` 是该指标实际使用的非空有效样本数。TTFB、抖动、下载、上传只使用测速成功且对应数值存在的记录；丢包使用所有具有丢包数值的记录。",
         "- 下载 CV = 下载速度总体标准差 / 均值，仅在至少 2 个下载有效样本时计算。CV 越低表示窗口内波动越小。",
-        "- 晚高峰为本机时区 20:00–23:59，日间基准为 09:00 与 14:00；括号显示晚高峰/日间有效下载样本数。负衰减表示晚高峰反而更快。",
+        "- 晚高峰按报告配置的评测时区计算，为 20:00–23:59；日间基准为 09:00 与 14:00。默认评测时区是 Asia/Shanghai，括号显示晚高峰/日间有效下载样本数；负衰减表示晚高峰反而更快。",
         "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
         "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
         "- ChatGPT 可用率的分母是实际完成 ChatGPT 检测的样本，只把 `available` 计为可用；地区不支持、Cloudflare challenge、明确阻断、限流和网络错误均不计为可用。它是未登录网络可达性检查，不使用或验证你的 ChatGPT 账号。",
@@ -402,14 +415,18 @@ def html_report(markdown_text: str, title: str = "Clash/Mihomo 供应商评测�
     return f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>{html.escape(title)}</title><style>{css}</style><main>{''.join(body)}</main></html>"
 
 
-def write_reports(conn: sqlite3.Connection, out_dir: Path, days: int = 7, run_id: str | None = None) -> dict[str, Path]:
+def write_reports(
+    conn: sqlite3.Connection, out_dir: Path, days: int = 7, run_id: str | None = None,
+    timezone_name: str = "Asia/Shanghai",
+) -> dict[str, Path]:
     selected = run_id or latest_run_id(conn)
     if not selected:
         raise ValueError("No completed runs are available for reporting")
     run = conn.execute("SELECT started_at FROM runs WHERE id=?", (selected,)).fetchone()
-    stamp = datetime.fromisoformat(run["started_at"]).astimezone().strftime("%Y%m%d-%H%M%S")
-    current_md = current_report(conn, selected)
-    trend_md = trend_report(conn, selected, days)
+    timezone = ZoneInfo(timezone_name)
+    stamp = datetime.fromisoformat(run["started_at"]).astimezone(timezone).strftime("%Y%m%d-%H%M%S")
+    current_md = current_report(conn, selected, timezone_name)
+    trend_md = trend_report(conn, selected, days, timezone_name)
     run_dir = out_dir / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     paths = {

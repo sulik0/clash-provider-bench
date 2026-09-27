@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import io
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -65,6 +66,19 @@ source_env = "DEMO_URL"
 checks = ["chatgpt", "not-a-service"]
 """, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Unknown enrichment checks"):
+                load_config(path)
+
+    def test_config_validates_report_timezone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bench.toml"
+            path.write_text("""
+[[providers]]
+name = "demo"
+source_env = "DEMO_URL"
+[report]
+timezone = "Not/A-Timezone"
+""", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unknown report.timezone"):
                 load_config(path)
 
     def test_parser_and_units(self):
@@ -157,6 +171,18 @@ checks = ["chatgpt", "not-a-service"]
         protocols = summarize_rows(rows, ("provider", "region", "proxy_type"))
         self.assertEqual({item["proxy_type"] for item in protocols}, {"VLESS", "Hysteria2"})
 
+    def test_report_time_buckets_use_configured_timezone(self):
+        rows = [{
+            "provider": "a", "region": "US", "proxy_type": "VLESS", "available": 1,
+            "ttfb_ms": 50, "jitter_ms": 5, "packet_loss_pct": 0,
+            "download_mbps": 100, "upload_mbps": 20, "status": "ok",
+            "tested_at": "2026-09-27T12:00:00+00:00",
+        }]
+        shanghai = summarize_rows(rows, ("provider", "region"), "Asia/Shanghai")[0]
+        utc = summarize_rows(rows, ("provider", "region"), "UTC")[0]
+        self.assertEqual((shanghai["evening_n"], shanghai["daytime_n"]), (1, 0))
+        self.assertEqual((utc["evening_n"], utc["daytime_n"]), (0, 0))
+
     def test_comparison_key_changes_with_real_test_conditions(self):
         settings = Settings(
             root=Path("/tmp"), database=Path("/tmp/test.db"), providers=[], regions=["JP"],
@@ -168,10 +194,14 @@ checks = ["chatgpt", "not-a-service"]
                "tunnel_interfaces_active": []}
         key, params = benchmark_profile(settings, ["JP"], "v1", env)
         self.assertNotIn("secret", str(params))
+        self.assertEqual(params["evaluation_timezone"], "Asia/Shanghai")
         different_version = benchmark_profile(settings, ["JP"], "v2", env)[0]
         different_tunnel = benchmark_profile(settings, ["JP"], "v1", {**env, "tunnel_interfaces_active": ["utun2"]})[0]
+        settings.report["timezone"] = "UTC"
+        different_timezone = benchmark_profile(settings, ["JP"], "v1", env)[0]
         self.assertNotEqual(key, different_version)
         self.assertNotEqual(key, different_tunnel)
+        self.assertNotEqual(key, different_timezone)
 
     def test_current_report_isolated_and_trend_only_matches_profile(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -329,6 +359,7 @@ speed_mode = "full"
 [report]
 output = "reports"
 days = 3
+timezone = "Asia/Shanghai"
 """, encoding="utf-8")
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -336,6 +367,10 @@ days = 3
             self.assertIn("[run] 开始", output.getvalue())
             self.assertIn("[1/2 alpha] 生成 mock 测试数据", output.getvalue())
             self.assertIn("[report] 生成", output.getvalue())
+            self.assertRegex(
+                output.getvalue(),
+                re.compile(r"\[20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\+08:00\] \[run\] 开始"),
+            )
             conn = connect(root / "data/bench.sqlite3")
             run = conn.execute("SELECT * FROM runs").fetchone()
             self.assertTrue(run["comparison_key"])
@@ -347,6 +382,9 @@ days = 3
             self.assertTrue((root / "reports/latest.md").exists())
             self.assertTrue((root / "reports/trend-3d.md").exists())
             self.assertEqual(len(list((root / "reports/runs").glob("*.md"))), 1)
+            latest = (root / "reports/latest.md").read_text(encoding="utf-8")
+            self.assertIn("+08:00（Asia/Shanghai）", latest)
+            self.assertIn("评测时区：Asia/Shanghai", latest)
 
 
 if __name__ == "__main__":
