@@ -63,9 +63,45 @@ path = "./private/provider.yaml"
 | `download_size_mb` / `upload_size_mb` | 每个节点的测速大小。 |
 | `timeout_seconds` | 节点测速超时。 |
 | `concurrent` | 单节点下载并发；公平比较期间应保持固定。 |
+| `progress_interval_seconds` | 测速内核没有逐节点事件时，终端进度心跳的间隔秒数。 |
 | `providers.user_agent` | 可选的订阅 User-Agent；服务商返回 Base64 URI 列表时可设为 `clash.meta`。 |
 | `enrichment.enabled` | 启动隔离 Mihomo，获取出口 IP、国家、地区、ASN 和组织。 |
-| `enrichment.unlock` | 最佳努力探测 ChatGPT、YouTube、Netflix 可达性；不等于登录后的完整解锁保证。 |
+| `enrichment.unlock` | 是否执行配置的服务可用性检测。 |
+| `enrichment.checks` | 只检测指定服务，例如 `["chatgpt"]`；可选值为 ChatGPT、YouTube、Netflix。 |
+| `enrichment.chatgpt_unsupported_countries` | 按实际出口国家标记已知不支持地区；建议根据 OpenAI 官方列表维护。 |
+
+### ChatGPT 优先的推荐参数
+
+若主要目的是筛选可用 ChatGPT 节点，推荐使用示例配置中的组合：
+
+```toml
+[engine]
+speed_mode = "download"
+server_url = "https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg"
+download_size_mb = 5
+timeout_seconds = 15
+concurrent = 2
+progress_interval_seconds = 5
+
+[enrichment]
+enabled = true
+timeout_seconds = 15
+unlock = true
+checks = ["chatgpt"]
+chatgpt_unsupported_countries = ["CN", "HK", "MO"]
+```
+
+这套参数用 5 MB 下载提供粗粒度线路质量信号，同时避免对几十个节点逐一进行大流量测速；并发 2 和 15 秒超时对远距离线路更宽容。上传大小在 `download` 模式下不会使用。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 仍可保留在测试列表中，作为识别实际出口和地区限制的对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
+
+ChatGPT 检测使用与浏览器相近的请求访问主站及一个无需登录即可返回认证状态的后端端点，并结合实际出口国家和 Cloudflare 响应分类：
+
+- `available`：未登录主页请求成功。
+- `unsupported-country`：实际出口位于配置的非支持地区，或响应明确表示地区不支持。
+- `challenge`：Cloudflare 要求挑战；这类出口可能在浏览器偶尔可用，但 CLI、桌面应用或长连接通常不够稳定。
+- `blocked`：明确返回阻断响应。
+- `rate-limited` / `http-*` / `error`：限流、异常 HTTP 响应或网络错误。
+
+检测不读取账号、Cookie 或 token，因此 `available` 代表节点具备未登录网络访问条件，不保证账号登录、工作区 IP 白名单或对话请求一定成功。OpenAI 官方也说明 ChatGPT 会使用主站、认证、静态资源和 WebSocket 等多个域名；完整网络要求见其[网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
 
 ## 报告文件
 
@@ -79,6 +115,7 @@ path = "./private/provider.yaml"
 
 - provider × 地区
 - provider × 地区 × 协议，例如 AnyTLS、Hysteria2、VLESS、Shadowsocks、Trojan、TUIC
+- provider × 地区的 ChatGPT 可用率，以及单次运行的逐节点 ChatGPT 结果
 
 ## 统计口径
 

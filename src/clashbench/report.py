@@ -28,6 +28,72 @@ def _json(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _cell(value: Any) -> str:
+    return str(value if value is not None else "—").replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def chatgpt_state(value: str | None) -> str:
+    if not value:
+        return "not-tested"
+    return value.split(":", 1)[0]
+
+
+def chatgpt_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for row in rows:
+        groups[(row["provider"], row["region"])].append(row)
+    output = []
+    for (provider, region), items in groups.items():
+        states = Counter(chatgpt_state(row["chatgpt"]) for row in items)
+        checked = len(items) - states["not-tested"]
+        available = states["available"]
+        unavailable = checked - available
+        output.append({
+            "provider": provider, "region": region, "samples": len(items), "checked": checked,
+            "available": available, "unsupported": states["unsupported-country"],
+            "challenge": states["challenge"], "blocked": states["blocked"],
+            "other": unavailable - states["unsupported-country"] - states["challenge"] - states["blocked"],
+            "availability": available / checked * 100 if checked else None,
+        })
+    return sorted(output, key=lambda row: (row["region"], row["provider"]))
+
+
+def _chatgpt_summary_table(items: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| 地区 | Provider | 总样本 | 已检测 | 可用 | 地区不支持 | Cloudflare 挑战 | 阻断 | 其他失败 | ChatGPT 可用率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in items:
+        lines.append(
+            f"| {_cell(row['region'])} | {_cell(row['provider'])} | {row['samples']} | {row['checked']} | "
+            f"{row['available']} | {row['unsupported']} | {row['challenge']} | {row['blocked']} | "
+            f"{row['other']} | {_f(row['availability'], '%')} |"
+        )
+    if not items:
+        lines.append("| — | — | 0 | 0 | 0 | 0 | 0 | 0 | 0 | — |")
+    return lines
+
+
+def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Provider | 地区 | 节点 | 协议 | ChatGPT 结果 | 出口国家 | ASN |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    found = False
+    for row in rows:
+        if not row["chatgpt"]:
+            continue
+        found = True
+        lines.append(
+            f"| {_cell(row['provider'])} | {_cell(row['region'])} | {_cell(row['node_name'])} | "
+            f"{_cell(_dimension_value(row, 'proxy_type'))} | `{_cell(row['chatgpt'])}` | "
+            f"{_cell(row['exit_country'])} | {_cell(row['asn'])} |"
+        )
+    if not found:
+        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — |")
+    return lines
+
+
 def _dimension_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
     value = row[key] or "unknown"
     if key != "proxy_type":
@@ -224,10 +290,12 @@ def _conditions(run: sqlite3.Row) -> list[str]:
     env = _json(run["environment_json"], {})
     proxy = env.get("system_proxy", {})
     enabled = [name.removesuffix("_enabled") for name, value in proxy.items() if name.endswith("_enabled") and value]
+    checks = params.get("enrichment_checks", [])
     return [
         f"- 对比条件 ID：`{run['comparison_key'] or 'legacy:' + run['config_digest']}`",
         f"- 引擎：{run['engine_version'] or run['engine']}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
         f"- 文件大小：下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
+        f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
         f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
         f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
     ]
@@ -249,6 +317,9 @@ def current_report(conn: sqlite3.Connection, run_id: str) -> str:
         out.append("| — | 旧数据未记录 | — | — | — |")
     out += ["", "## 本次：Provider × 地区", "", *_summary_table(regional, ("provider", "region")),
             "", "## 本次：Provider × 地区 × 协议", "", *_summary_table(protocol, ("provider", "region", "proxy_type")),
+            "", "## 本次 ChatGPT 可用性", "", *_chatgpt_summary_table(chatgpt_summary(rows)),
+            "", "> `available` 表示该节点可正常取得 ChatGPT 未登录首页；`challenge`、`blocked` 和 `unsupported-country` 均不计为可用。该检测不使用账号，因此不能证明登录后对话一定成功。", "",
+            *_chatgpt_node_table(rows),
             "", "## 本次基础设施多样性", "", *_infra_table(infrastructure_summary(rows)), "", "## 本次异常", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
     enrichment_failures = sum(1 for row in rows if row["enrichment_status"] in ("failed", "partial"))
@@ -272,7 +343,8 @@ def trend_report(conn: sqlite3.Connection, run_id: str, days: int) -> str:
            f"> 本报告只统计与锚点运行 `{run_id}` 对比条件完全一致且状态为 ok 的运行：{run_count} 次；另有 {excluded} 次因条件不同、旧格式、partial 或 failed 未混入统计。", "",
            "## 对比条件", "", *_conditions(anchor), "", "## Provider × 地区趋势", "",
            *_summary_table(regional, ("provider", "region")), "", "## Provider × 地区 × 协议趋势", "",
-           *_summary_table(protocol, ("provider", "region", "proxy_type")), "", "## 基础设施多样性（每节点取窗口内最新观测）", "",
+           *_summary_table(protocol, ("provider", "region", "proxy_type")), "", "## ChatGPT 可用性趋势", "",
+           *_chatgpt_summary_table(chatgpt_summary(rows)), "", "## 基础设施多样性（每节点取窗口内最新观测）", "",
            *_infra_table(infrastructure_summary(rows)), "", "## 异常", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
     out += ["", "## 历史条件清单（各组不互相混合）", "", "| 条件 ID | 全部运行 | 完整运行 |", "|---|---:|---:|"]
@@ -291,6 +363,7 @@ def _methodology() -> list[str]:
         "- 晚高峰为本机时区 20:00–23:59，日间基准为 09:00 与 14:00；括号显示晚高峰/日间有效下载样本数。负衰减表示晚高峰反而更快。",
         "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
         "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
+        "- ChatGPT 可用率的分母是实际完成 ChatGPT 检测的样本，只把 `available` 计为可用；地区不支持、Cloudflare challenge、明确阻断、限流和网络错误均不计为可用。它是未登录网络可达性检查，不使用或验证你的 ChatGPT 账号。",
     ]
 
 

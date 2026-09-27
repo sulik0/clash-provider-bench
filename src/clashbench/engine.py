@@ -8,8 +8,10 @@ import re
 import shutil
 import ssl
 import subprocess
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
@@ -146,10 +148,15 @@ def subscription_format(content: bytes) -> str:
     return "unknown"
 
 
-def materialize_provider(provider: Provider, runtime: Path, user_agent: str) -> Path:
+def materialize_provider(
+    provider: Provider, runtime: Path, user_agent: str,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
     source = provider_source(provider)
     target = runtime / "configs" / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', provider.name)}.yaml"
     if isinstance(source, Path):
+        if progress:
+            progress("读取本地订阅配置")
         content = source.read_bytes()
         detected = subscription_format(content)
     else:
@@ -160,7 +167,9 @@ def materialize_provider(provider: Provider, runtime: Path, user_agent: str) -> 
         candidates = list(dict.fromkeys(value for value in candidates if value))
         content, detected = b"", "empty"
         context = ssl.create_default_context(cafile=certifi.where())
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates, 1):
+            if progress:
+                progress(f"请求订阅：尝试 {index}/{len(candidates)}")
             request = urllib.request.Request(source, headers={"User-Agent": candidate, "Accept": "*/*"})
             try:
                 with urllib.request.urlopen(request, timeout=30, context=context) as response:
@@ -180,6 +189,8 @@ def materialize_provider(provider: Provider, runtime: Path, user_agent: str) -> 
             "set provider.user_agent to a UA supported by the subscription service"
         )
     ensure_private_file(target, content)
+    if progress:
+        progress(f"订阅配置就绪：{len(load_nodes(target))} 个内嵌节点")
     return target
 
 
@@ -197,9 +208,17 @@ class FaceairAdapter:
         proc = subprocess.run([found, "-v"], capture_output=True, text=True, timeout=10)
         return proc.returncode == 0, (proc.stdout or proc.stderr).strip()
 
-    def run(self, provider: Provider, config_path: Path, regions: list[str]) -> list[Measurement]:
+    def run(
+        self, provider: Provider, config_path: Path, regions: list[str],
+        progress: Callable[[str], None] | None = None,
+    ) -> list[Measurement]:
         engine = self.settings.engine
         speed_mode = str(engine.get("speed_mode", "full"))
+        nodes = load_nodes(config_path)
+        selected_nodes = sum(
+            1 for name in nodes
+            if not regions or classify_region(name, self.settings.region_patterns) in regions
+        )
         args = [
             self.binary,
             "-c", str(config_path),
@@ -211,10 +230,32 @@ class FaceairAdapter:
             "-timeout", f"{int(engine.get('timeout_seconds', 8))}s",
             "-concurrent", str(int(engine.get("concurrent", 4))),
         ]
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=int(engine.get("process_timeout_seconds", 3600)))
+        process_timeout = int(engine.get("process_timeout_seconds", 3600))
+        progress_interval = max(1, int(engine.get("progress_interval_seconds", 5)))
+        started = time.monotonic()
+        if progress:
+            count = str(selected_nodes) if nodes else "未知"
+            progress(f"测速内核运行中：已匹配 {count} 个节点")
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while True:
+            elapsed = time.monotonic() - started
+            remaining = process_timeout - elapsed
+            if remaining <= 0:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(args, process_timeout, output=stdout, stderr=stderr)
+            try:
+                stdout, stderr = proc.communicate(timeout=min(progress_interval, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if progress:
+                    progress(f"测速内核运行中：已用时 {int(time.monotonic() - started)} 秒")
         if proc.returncode != 0:
-            raise RuntimeError(f"clash-speedtest failed for provider {provider.name!r}: {redact(proc.stderr)[-600:]}")
-        return parse_faceair_tsv(proc.stdout, provider.name, load_nodes(config_path), self.settings.region_patterns)
+            raise RuntimeError(f"clash-speedtest failed for provider {provider.name!r}: {redact(stderr)[-600:]}")
+        values = parse_faceair_tsv(stdout, provider.name, nodes, self.settings.region_patterns)
+        if progress:
+            progress(f"测速内核完成：返回 {len(values)} 条节点结果，用时 {int(time.monotonic() - started)} 秒")
+        return values
 
 
 def write_mock_tsv(path: Path, provider: str) -> str:

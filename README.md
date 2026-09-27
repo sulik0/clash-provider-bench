@@ -1,6 +1,6 @@
 # Clash Provider Bench
 
-Clash Provider Bench 是一个面向 macOS 的 Clash/Mihomo 订阅自动化评测工具。它复用 `faceair/clash-speedtest` 和 Mihomo，统一测试多个 provider 的节点可用率、延迟、抖动、丢包、上下行速度及出口信息，并生成单次报告与 3～7 天趋势报告。
+Clash Provider Bench 是一个面向 macOS 的 Clash/Mihomo 订阅自动化评测工具。它复用 `faceair/clash-speedtest` 和 Mihomo，统一测试多个 provider 的节点可用率、延迟、抖动、丢包、上下行速度及出口信息，并重点识别每个节点能否访问 ChatGPT。运行时会显示 provider、测速阶段和逐节点检测进度，并生成单次报告与 3～7 天趋势报告。
 
 项目支持订阅 URL 和本地 YAML，测试结果保存在 SQLite、CSV、Markdown 和 HTML 中。订阅 token 不会写入日志或报告。测试原理、配置项、统计口径及长期对比规则见 [详细说明](docs/guide.md)。
 

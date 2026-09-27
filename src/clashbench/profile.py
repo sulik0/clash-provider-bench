@@ -22,6 +22,12 @@ def benchmark_profile(
 ) -> tuple[str, dict[str, Any]]:
     engine = settings.engine
     enrichment = settings.enrichment
+    unlock_enabled = bool(enrichment.get("unlock", False))
+    enrichment_checks = enrichment.get("checks")
+    if enrichment_checks is None:
+        enrichment_checks = ["chatgpt", "youtube", "netflix"] if unlock_enabled else []
+    if not unlock_enabled:
+        enrichment_checks = []
     endpoint_value = str(engine.get("server_url", "https://speed.cloudflare.com"))
     endpoint_query = urllib.parse.urlsplit(endpoint_value).query
     parameters = {
@@ -38,7 +44,11 @@ def benchmark_profile(
         "regions": sorted(set(regions)),
         "providers": sorted(provider.name for provider in settings.providers),
         "enrichment_enabled": bool(enrichment.get("enabled", False)),
-        "unlock_enabled": bool(enrichment.get("unlock", False)),
+        "unlock_enabled": unlock_enabled,
+        "enrichment_checks": sorted(str(value).lower() for value in enrichment_checks),
+        "chatgpt_unsupported_countries": sorted(
+            str(value).upper() for value in enrichment.get("chatgpt_unsupported_countries", [])
+        ) if "chatgpt" in {str(value).lower() for value in enrichment_checks} else [],
         "platform": platform.system(),
         "machine": platform.machine(),
         "os_version": platform.mac_ver()[0] or platform.release(),

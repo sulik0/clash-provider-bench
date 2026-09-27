@@ -47,15 +47,36 @@ def load_config(path: str | Path) -> Settings:
                                   user_agent=item.get("user_agent")))
     if not providers:
         raise ValueError("At least one [[providers]] entry is required")
+    engine = dict(raw.get("engine", {}))
+    speed_mode = str(engine.get("speed_mode", "full"))
+    if speed_mode not in {"fast", "download", "full"}:
+        raise ValueError("engine.speed_mode must be fast, download, or full")
+    for name, default in (
+        ("download_size_mb", 20), ("upload_size_mb", 10), ("timeout_seconds", 8),
+        ("process_timeout_seconds", 3600), ("concurrent", 4), ("progress_interval_seconds", 5),
+    ):
+        if int(engine.get(name, default)) <= 0:
+            raise ValueError(f"engine.{name} must be greater than zero")
+    enrichment = dict(raw.get("enrichment", {}))
+    checks = enrichment.get("checks")
+    if checks is not None:
+        if not isinstance(checks, list) or not all(isinstance(value, str) for value in checks):
+            raise ValueError("enrichment.checks must be a list of service names")
+        unknown = {value.lower() for value in checks} - {"chatgpt", "youtube", "netflix"}
+        if unknown:
+            raise ValueError(f"Unknown enrichment checks: {', '.join(sorted(unknown))}")
+    unsupported = enrichment.get("chatgpt_unsupported_countries", [])
+    if not isinstance(unsupported, list) or not all(isinstance(value, str) and len(value) == 2 for value in unsupported):
+        raise ValueError("enrichment.chatgpt_unsupported_countries must contain two-letter country codes")
     database = (root / raw.get("database", "data/bench.sqlite3")).resolve()
     return Settings(
         root=root,
         database=database,
         providers=providers,
         regions=[str(x).upper() for x in raw.get("regions", [])],
-        engine=dict(raw.get("engine", {})),
+        engine=engine,
         report=dict(raw.get("report", {})),
-        enrichment=dict(raw.get("enrichment", {})),
+        enrichment=enrichment,
         region_patterns={k.upper(): list(v) for k, v in raw.get("region_patterns", {}).items()},
         raw=raw,
     )

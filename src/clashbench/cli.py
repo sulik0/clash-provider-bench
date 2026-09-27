@@ -42,6 +42,10 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _progress(prefix: str, message: str) -> None:
+    print(f"[{prefix}] {message}", flush=True)
+
+
 def cmd_run(args) -> int:
     config_path = Path(args.config).expanduser().resolve()
     load_dotenv(config_path.parent / ".env")
@@ -66,17 +70,23 @@ def cmd_run(args) -> int:
     )
     runtime = settings.root / ".runtime" / run_id
     errors, total = [], 0
+    _progress("run", f"开始 {run_id}；Provider 顺序：{' → '.join(provider_order)}")
     try:
         for ordinal, provider_name in enumerate(provider_order):
             provider = providers_by_name[provider_name]
+            prefix = f"{ordinal + 1}/{len(provider_order)} {provider.name}"
             begin_provider(conn, run_id, provider.name, ordinal)
             try:
                 if args.mock:
+                    _progress(prefix, "生成 mock 测试数据")
                     values = parse_faceair_tsv(write_mock_tsv(runtime, provider.name), provider.name, {}, settings.region_patterns)
                     values = [x for x in values if not regions or x.region in regions]
                 else:
-                    config = materialize_provider(provider, runtime, str(settings.engine.get("user_agent", "mihomo/1.19")))
-                    values = adapter.run(provider, config, regions)
+                    config = materialize_provider(
+                        provider, runtime, str(settings.engine.get("user_agent", "mihomo/1.19")),
+                        lambda message: _progress(prefix, message),
+                    )
+                    values = adapter.run(provider, config, regions, lambda message: _progress(prefix, message))
                     if settings.enrichment.get("enabled", False):
                         try:
                             mihomo_binary = str(settings.enrichment.get("mihomo_binary", "mihomo"))
@@ -84,8 +94,21 @@ def cmd_run(args) -> int:
                                 mihomo_binary = str((settings.root / mihomo_binary).resolve())
                             with MihomoEnricher(mihomo_binary, runtime, config,
                                                 bool(settings.enrichment.get("unlock", False)),
-                                                int(settings.enrichment.get("timeout_seconds", 15))) as enricher:
-                                enricher.enrich(values)
+                                                int(settings.enrichment.get("timeout_seconds", 15)),
+                                                settings.enrichment.get("checks"),
+                                                settings.enrichment.get("chatgpt_unsupported_countries", ())) as enricher:
+                                checks = ",".join(sorted(enricher.checks)) or "仅出口信息"
+                                _progress(prefix, f"开始逐节点附加检测：{len(values)} 个节点；项目={checks}")
+
+                                def enrichment_progress(index, count, item, phase):
+                                    name = " ".join(item.node_name.split())[:60]
+                                    if phase == "start":
+                                        _progress(prefix, f"附加检测 {index}/{count}：{name}")
+                                    else:
+                                        result = item.chatgpt or item.enrichment_status
+                                        _progress(prefix, f"附加检测 {index}/{count} 完成：{result}")
+
+                                enricher.enrich(values, enrichment_progress)
                         except Exception as exc:
                             for item in values:
                                 if item.available:
@@ -93,21 +116,22 @@ def cmd_run(args) -> int:
                                     item.enrichment_error = type(exc).__name__
                                 else:
                                     item.enrichment_status = "skipped"
-                            print(f"[{provider.name}] enrichment failed: {type(exc).__name__}", file=sys.stderr)
+                            print(f"[{prefix}] enrichment failed: {type(exc).__name__}", file=sys.stderr, flush=True)
                 count = add_measurements(conn, run_id, values)
                 total += count
                 finish_provider(conn, run_id, provider.name, "ok", count)
-                print(f"[{provider.name}] stored {len(values)} measurements")
+                _progress(prefix, f"已保存 {len(values)} 条测量")
             except Exception as exc:
                 message = redact(exc)
                 errors.append(f"{provider.name}: {message}")
                 finish_provider(conn, run_id, provider.name, "failed", 0, message)
-                print(f"[{provider.name}] failed: {message}", file=sys.stderr)
+                print(f"[{prefix}] failed: {message}", file=sys.stderr, flush=True)
         status = "partial" if errors and total else "failed" if errors else "ok"
         finish_run(conn, run_id, status, " | ".join(errors) or None)
     finally:
         shutil.rmtree(runtime, ignore_errors=True)
     out_dir = settings.root / settings.report.get("output", "reports")
+    _progress("report", "生成单次报告、趋势报告和 CSV")
     reports = write_reports(conn, out_dir, int(settings.report.get("days", 7)), run_id)
     export_csv(conn, out_dir / "results.csv")
     print(f"run={run_id} status={'partial' if errors and total else 'failed' if errors else 'ok'} rows={total}")
@@ -127,6 +151,19 @@ def cmd_doctor(args) -> int:
         state = "configured" if provider.path or (provider.source_env and os.environ.get(provider.source_env)) else "missing env"
         print(f"{'OK' if state == 'configured' else 'MISSING'} provider {provider.name}: {state}")
         if state != "configured": ok = False
+    if settings.enrichment.get("enabled", False):
+        configured = str(settings.enrichment.get("mihomo_binary", "mihomo"))
+        candidate = (settings.root / configured).resolve() if "/" in configured else Path(configured)
+        found = candidate.is_file() or bool(shutil.which(configured))
+        checks = settings.enrichment.get("checks")
+        if checks is None:
+            checks = ["chatgpt", "youtube", "netflix"] if settings.enrichment.get("unlock") else []
+        if not settings.enrichment.get("unlock"):
+            checks = []
+        print(f"{'OK' if found else 'MISSING'} Mihomo: {candidate if candidate.is_file() else configured}")
+        print(f"OK enrichment: checks={','.join(checks) or 'egress-only'}; timeout={int(settings.enrichment.get('timeout_seconds', 15))}s")
+        if not found:
+            ok = False
     return 0 if ok else 1
 
 
