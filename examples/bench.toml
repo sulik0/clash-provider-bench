@@ -1,0 +1,45 @@
+database = "../data/bench.sqlite3"
+regions = ["JP", "HK", "SG", "US"]
+
+[[providers]]
+name = "taishan"
+source_env = "TAISHAN_SUB_URL"
+
+[[providers]]
+name = "cokecloud"
+source_env = "COKECLOUD_SUB_URL"
+
+# Local YAML is also supported; use exactly one of path/source_env per provider.
+# [[providers]]
+# name = "local-snapshot"
+# path = "./private/local.yaml"
+
+[engine]
+adapter = "faceair"
+binary = "../tools/bin/clash-speedtest"
+speed_mode = "full"
+server_url = "https://speed.cloudflare.com"
+download_size_mb = 20
+upload_size_mb = 10
+timeout_seconds = 8
+process_timeout_seconds = 3600
+concurrent = 4
+user_agent = "mihomo/1.19"
+
+[enrichment]
+# Starts a separate, isolated Mihomo process for each provider and selects every
+# node through the official REST API. Enable for egress IP/country/ASN.
+enabled = true
+mihomo_binary = "../tools/bin/mihomo"
+timeout_seconds = 15
+# Best-effort reachability checks, not an account/login guarantee.
+unlock = false
+
+[report]
+output = "../reports"
+days = 7
+
+# Override/add classification rules if your provider uses unusual names.
+# [region_patterns]
+# JP = ["(?i)日本|东京|JP"]
+

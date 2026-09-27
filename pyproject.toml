@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clash-provider-bench"
+version = "0.1.0"
+description = "Reproducible Clash/Mihomo provider benchmarking orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0.1", "certifi>=2025.1.31"]
+license = {text = "MIT"}
+
+[project.scripts]
+clashbench = "clashbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

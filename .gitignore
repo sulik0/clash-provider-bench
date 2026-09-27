@@ -1,0 +1,14 @@
+.venv/
+.idea/
+.env
+data/
+reports/
+.runtime/
+tools/bin/
+*.sqlite3
+*.db
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
