@@ -71,6 +71,9 @@ path = "./private/provider.yaml"
 | `enrichment.checks` | 只检测指定服务，例如 `["chatgpt"]`；可选值为 ChatGPT、YouTube、Netflix。 |
 | `enrichment.workers` | 附加检测并行 worker 数；每个 worker 使用独立 Mihomo 进程，范围 1～16。 |
 | `enrichment.chatgpt_unsupported_countries` | 按实际出口国家标记已知不支持地区；建议根据 OpenAI 官方列表维护。 |
+| `enrichment.websocket_hold_seconds` | 两阶段模式中每次 ChatGPT WebSocket 需要连续存活的秒数，范围 5～120。 |
+| `enrichment.websocket_reconnect_attempts` | WebSocket 提前异常断开后，用新签名地址重连的次数，范围 0～3。 |
+| `enrichment.chatgpt_access_token_env` | 可选 ChatGPT Web access token 的环境变量名；只从环境读取，不持久化。 |
 | `report.timezone` | 报告展示、文件命名、日间和晚高峰分桶使用的 IANA 时区；示例固定为 `Asia/Shanghai`。 |
 | `notification.enabled` | 每次真实评测完成后发送原生 macOS 通知。 |
 | `notification.mode` | 当前支持 `macos`，通知包含总 ChatGPT 可用数及各 provider 分项。 |
@@ -94,6 +97,9 @@ progress_interval_seconds = 5
 enabled = true
 timeout_seconds = 15
 workers = 4
+websocket_hold_seconds = 15
+websocket_reconnect_attempts = 1
+chatgpt_access_token_env = "CHATGPT_ACCESS_TOKEN"
 unlock = true
 checks = ["chatgpt"]
 chatgpt_unsupported_countries = ["CN", "HK", "MO"]
@@ -105,7 +111,7 @@ chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 clashbench run --config examples/bench.toml --two-stage
 ```
 
-阶段 1 对全部候选节点运行 `fast` 模式，只取得延迟、抖动和丢包，再检查出口与 ChatGPT；阶段 2 只把所有 ChatGPT 子检查均通过的节点交给 `clash-speedtest`，按配置的 `speed_mode` 和 50/20 MB 大文件参数测速。未通过筛选的节点不会消耗大流量，也不会被计为吞吐失败。附加检测使用 4 个独立 Mihomo worker 并行处理，不共享 `GLOBAL` 选择器、连接池或 Cookie。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 可保留为地区限制对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
+阶段 1 对全部节点运行 `fast` 模式，只取得延迟、抖动和丢包，再检查出口以及 ChatGPT 页面、后端、认证和静态资源基础路径。阶段 2 只对基础检查为 `available` 的候选节点执行两类测试：ChatGPT WebSocket 稳定性探测，以及按配置的 `speed_mode` 和 50/20 MB 参数进行大流量测速。WebSocket 失败不会抹掉基础可达性，也不会阻止吞吐测速；未通过第一阶段的节点不会消耗大流量，也不会被计为吞吐失败。附加检测使用独立 Mihomo worker，不共享 `GLOBAL` 选择器、连接池或 Cookie。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 可保留为地区限制对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
 
 如果本次目的只是尽快判断哪些节点能访问 ChatGPT，可使用：
 
@@ -115,24 +121,37 @@ clashbench run --config examples/bench.toml --quick
 
 快速模式把本次运行的 `speed_mode` 独立改为 `fast`，保留节点延迟、抖动、丢包、出口和 ChatGPT 检测，但完全跳过下载/上传。普通 `run` 对全部节点执行配置的吞吐测速；`--two-stage` 则只测速 ChatGPT 可用节点。三种策略会获得不同的对比条件 ID，不会混合趋势。
 
-ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹，并结合实际出口国家和 Cloudflare 响应分类。每个节点使用独立会话，避免节点切换后复用上一个出口的连接或 Cookie。一次完整检查包含：
+ChatGPT 基础检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹，并结合实际出口国家和 Cloudflare 响应分类。每个节点使用独立会话，避免节点切换后复用上一个出口的连接或 Cookie。第一阶段包含：
 
 - `chatgpt.com` 首页及 `/backend-api/me`：检查网页外壳和 ChatGPT 后端路径。
 - `auth.openai.com`：检查认证域名的 DNS、TLS 和 HTTP 路径；401/403 仍表示已抵达认证边界，不表示登录成功。
 - `cdn.oaistatic.com`：检查静态资源域名；根路径的 403/404 仍表示域名与 TLS 路径可达。
-- `api.openai.com/v1/realtime`：经 Mihomo 代理执行真实 WebSocket Upgrade 请求；不发送 API key，因此 401/403 表示握手请求抵达 OpenAI 认证边界，不能证明认证后的帧传输成功。
 
-只有以上路径全部可达，最终状态才是 `available`：
+以上基础路径全部可达时，第一阶段状态为 `available`：
 
-- `available`：页面/后端、认证域名、静态资源和 WebSocket 认证边界全部可达。
+- `available`：页面/后端、认证域名和静态资源均可达；这只是第二阶段候选资格，不代表长连接稳定。
 - `unsupported-country`：实际出口位于配置的非支持地区，或响应明确表示地区不支持。
 - `challenge`：Cloudflare 要求挑战；这类出口可能在浏览器偶尔可用，但 CLI、桌面应用或长连接通常不够稳定。
 - `blocked`：明确返回阻断响应。
 - `rate-limited` / `http-*` / `error`：限流、异常 HTTP 响应或网络错误。
 
-不能用普通 Python `urllib` 的响应直接判断 ChatGPT：它的 TLS 指纹可能让所有正常出口都收到 `Cf-Mitigated: challenge`，从而产生系统性假阴性。探测客户端及其版本会写入 `comparison_key`，更换客户端后旧结果不会和新结果混合统计。
+第二阶段不再把 OpenAI API 的 `api.openai.com/v1/realtime` 当成 ChatGPT 网页 WebSocket。该路径属于 OpenAI Realtime API，不能代表 ChatGPT Web 的传输质量。当前实现通过 `POST https://chatgpt.com/backend-api/register-websocket` 获取短期、一次性的签名 `wss_url`，再通过同一节点连接返回的动态地址和 `json.reliable.webpubsub.azure.v1` 子协议。签名 URL 的查询参数不会写入日志、数据库或报告。
 
-检测不读取账号、Cookie、OpenAI API key 或 token，因此 `available` 代表节点具备匿名网络访问条件，不保证账号登录、工作区 IP 白名单或认证后的实际对话一定成功。OpenAI 官方也说明 ChatGPT 会使用主站、认证、静态资源和 WebSocket 等多个域名；完整网络要求见其[网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
+握手拿到 HTTP 101 后，程序仍会保持连接并定期发送 Ping。连接达到 `websocket_hold_seconds` 才算稳定；提前收到 Close、TLS/网络断开或帧错误会累计一次异常断开。发生断开时，每次重连都会重新调用注册接口获取新签名地址，避免误用过期 token。报告状态含义如下：
+
+- `handshake-failed`：注册或 WebSocket Upgrade 失败，持续时长为 0。
+- `auth-required`：没有配置 ChatGPT Web access token，因此未执行认证后的注册和连接；它不判定为节点长连接失败，也不进入稳定率分母。
+- `stable`：首次握手成功，且同一连接连续保持到配置阈值。
+- `stable-after-reconnect`：首次连接提前断开，但重新注册并连接后保持到阈值。
+- `unstable-disconnected`：握手曾成功，但在所有允许尝试中都提前异常断开。
+
+`chatgpt_websocket` 保留初次握手结果，`chatgpt_websocket_seconds` 是所有尝试中最长的一次连续存活时长，不会把多次短连接相加；`chatgpt_websocket_disconnects` 是异常断开次数，`chatgpt_websocket_reconnect` 记录是否恢复。单次 101 绝不等同于稳定可用。
+
+不能用普通 Python `urllib` 的响应直接判断 ChatGPT：它的 TLS 指纹可能让所有正常出口都收到 `Cf-Mitigated: challenge`，从而产生系统性假阴性。探测客户端、路径、保持时间和重连次数会写入 `comparison_key`，修改后旧结果不会和新结果混合统计。
+
+基础检测不读取账号或 Cookie。当前 ChatGPT WebSocket 注册可能要求登录账号的 access token；如需完成认证后的稳定性测试，可在 `examples/.env` 中设置 `CHATGPT_ACCESS_TOKEN`，或用 `chatgpt_access_token_env` 指向其他环境变量。程序不会自动提取浏览器/Codex 凭据，不接受 OpenAI API key 代替 Web access token，也不会记录该值。动态 WebSocket URL 中由 ChatGPT 注册接口返回的短期签名同样只在内存中使用。access token 通常会过期，报告连续出现 `auth-required` 或认证后的 `registration-reachable:http-401` 时应更新它。
+
+因此，第一阶段 `available` 仅代表匿名基础路径正常；第二阶段 `stable` 才表示使用当前认证模式时的 WebSocket 网络路径连续通过，但仍不保证账号权限、工作区 IP 白名单或一次真实对话必然成功。OpenAI 官方也说明 ChatGPT 会使用主站、认证、静态资源和 WebSocket 等多个域名；完整网络要求见其[网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
 
 ## 报告文件
 
@@ -147,6 +166,7 @@ ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹，并结合�
 - provider × 地区
 - provider × 地区 × 协议，例如 AnyTLS、Hysteria2、VLESS、Shadowsocks、Trojan、TUIC
 - provider × 地区的 ChatGPT 可用率，以及单次运行的逐节点 ChatGPT 结果
+- provider × 地区的 WebSocket 握手率、最终稳定率、最长连续时长 P50、异常断开与重连恢复数量
 
 ## 统计口径
 
@@ -177,6 +197,7 @@ ChatGPT 检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹，并结合�
 - 地区集合
 - enrichment/unlock 开关
 - enrichment 并行 worker 数
+- ChatGPT WebSocket 注册路径、保持时长、重连次数和是否配置认证凭据（不包含凭据值）
 - macOS 版本和 CPU 架构
 - 默认网络接口
 - 系统代理启用类型和代理服务器哈希
@@ -232,7 +253,7 @@ SQLite 中的原始时间继续使用带时区的 UTC，保证历史数据和跨
 
 - `runs`：运行状态、对比条件、公开测速参数、内核版本、provider 顺序和脱敏网络环境。
 - `provider_runs`：每个 provider 的执行顺序、开始/结束时间、状态、测量数和脱敏错误。
-- `measurements`：节点、地区、协议、测速指标与状态，以及独立的 enrichment 状态和出口信息。
+- `measurements`：节点、地区、协议、测速指标与状态，以及独立的 enrichment、出口信息和 WebSocket 握手/时长/断开/重连/稳定性字段。
 
 启动时会自动增量迁移旧数据库，只增加列和表，不删除或重写历史记录。升级前仍建议备份：
 
@@ -268,6 +289,7 @@ clashbench notify --config examples/bench.toml --test
 - `clash-speedtest` TSV 不暴露 6 次 HEAD 的逐次样本，也不单独暴露内部 download/upload error 字段。
 - Mihomo `GLOBAL` 选择依赖 global 模式；复杂 rule-provider 配置可能无法 enrichment，但测速结果仍会保留。
 - 解锁检测只代表匿名 HTTP 可达性，可能受页面策略和登录账户区域影响。
+- ChatGPT Web 的注册路径不是公开稳定 API，网页协议变化时可能需要升级本工具；报告会保留失败类型，不会回退到无关的 API Realtime 端点。
 
 ## 开发与验证
 

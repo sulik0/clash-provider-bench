@@ -182,6 +182,9 @@ def cmd_run(args) -> int:
                                 settings.enrichment.get("checks"),
                                 settings.enrichment.get("chatgpt_unsupported_countries", ()),
                                 worker_count,
+                                os.environ.get(str(settings.enrichment.get(
+                                    "chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN",
+                                ))),
                             ) as enricher:
                                 checks = ",".join(sorted(enricher.checks)) or "仅出口信息"
                                 progress(
@@ -205,6 +208,67 @@ def cmd_run(args) -> int:
                                         progress(prefix, f"附加检测 {index}/{count} 完成：{result}")
 
                                 enricher.enrich(values, enrichment_progress)
+                                if args.two_stage:
+                                    websocket_candidates = [
+                                        item for item in values
+                                        if (item.chatgpt or "").startswith("available")
+                                    ]
+                                    progress(
+                                        prefix,
+                                        f"阶段 1/2 完成：{len(websocket_candidates)}/{len(values)} 个节点"
+                                        "通过基础 ChatGPT 检查",
+                                    )
+                                    if websocket_candidates:
+                                        hold_seconds = int(settings.enrichment.get("websocket_hold_seconds", 15))
+                                        reconnect_attempts = int(
+                                            settings.enrichment.get("websocket_reconnect_attempts", 1)
+                                        )
+                                        progress(
+                                            prefix,
+                                            f"阶段 2/2：WebSocket 稳定性检测；保持 {hold_seconds} 秒；"
+                                            f"重连 {reconnect_attempts} 次",
+                                        )
+
+                                        def websocket_progress(index, count, item, phase):
+                                            name = " ".join(item.node_name.split())[:60]
+                                            if phase == "start":
+                                                progress(prefix, f"WebSocket {index}/{count}：{name}")
+                                            else:
+                                                progress(
+                                                    prefix,
+                                                    f"WebSocket {index}/{count} 完成："
+                                                    f"{item.chatgpt_websocket_stability}",
+                                                )
+
+                                        try:
+                                            enricher.probe_websocket_stability(
+                                                websocket_candidates, hold_seconds,
+                                                reconnect_attempts, websocket_progress,
+                                            )
+                                        except Exception as exc:
+                                            # This is an enrichment result. A pool-level failure must
+                                            # not erase valid stage-1 reachability or speed data.
+                                            detail = type(exc).__name__
+                                            for item in websocket_candidates:
+                                                if item.chatgpt_websocket_stability:
+                                                    continue
+                                                item.chatgpt_websocket = f"error:{detail}"
+                                                item.chatgpt_websocket_seconds = 0.0
+                                                item.chatgpt_websocket_disconnects = 0
+                                                item.chatgpt_websocket_reconnect = "not-attempted"
+                                                item.chatgpt_websocket_stability = "handshake-failed"
+                                                item.enrichment_error = ";".join(filter(None, (
+                                                    item.enrichment_error,
+                                                    f"websocket:{detail}",
+                                                )))
+                                                if item.enrichment_status == "ok":
+                                                    item.enrichment_status = "partial"
+                                            progress(
+                                                prefix,
+                                                f"WebSocket 稳定性检测失败：{detail}；"
+                                                "基础 ChatGPT 与测速结果继续保留",
+                                                file=sys.stderr,
+                                            )
                         except Exception as exc:
                             for item in values:
                                 if item.available:
@@ -218,10 +282,6 @@ def cmd_run(args) -> int:
                             item.node_name for item in values
                             if (item.chatgpt or "").startswith("available")
                         }
-                        progress(
-                            prefix,
-                            f"阶段 1/2 完成：{len(selected_names)}/{len(values)} 个节点通过 ChatGPT 检查",
-                        )
                         second_stage: list[Measurement] = []
                         if selected_names:
                             progress(
@@ -305,7 +365,16 @@ def cmd_doctor(args) -> int:
         print(
             f"OK enrichment: checks={','.join(checks) or 'egress-only'}; "
             f"timeout={int(settings.enrichment.get('timeout_seconds', 15))}s; "
-            f"workers={int(settings.enrichment.get('workers', 1))}"
+            f"workers={int(settings.enrichment.get('workers', 1))}; "
+            f"websocket_hold={int(settings.enrichment.get('websocket_hold_seconds', 15))}s; "
+            f"websocket_reconnects={int(settings.enrichment.get('websocket_reconnect_attempts', 1))}"
+        )
+        token_env = str(settings.enrichment.get(
+            "chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN",
+        ))
+        print(
+            "OK ChatGPT WebSocket credential: "
+            + ("configured" if os.environ.get(token_env) else "not configured (reports auth-required)")
         )
         if not found:
             ok = False

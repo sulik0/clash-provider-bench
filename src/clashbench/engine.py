@@ -50,6 +50,10 @@ class Measurement:
     chatgpt_auth: str | None = None
     chatgpt_static: str | None = None
     chatgpt_websocket: str | None = None
+    chatgpt_websocket_seconds: float | None = None
+    chatgpt_websocket_disconnects: int | None = None
+    chatgpt_websocket_reconnect: str | None = None
+    chatgpt_websocket_stability: str | None = None
     throughput_attempted: bool | None = None
     enrichment_status: str = "not_requested"
     enrichment_error: str | None = None

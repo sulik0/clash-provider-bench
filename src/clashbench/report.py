@@ -79,10 +79,57 @@ def _chatgpt_summary_table(items: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def websocket_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for row in rows:
+        if _row_get(row, "chatgpt_websocket_stability"):
+            groups[(row["provider"], row["region"])].append(row)
+    output = []
+    for (provider, region), items in groups.items():
+        states = Counter(_row_get(row, "chatgpt_websocket_stability") for row in items)
+        durations = [
+            float(_row_get(row, "chatgpt_websocket_seconds")) for row in items
+            if _row_get(row, "chatgpt_websocket_seconds") is not None
+            and _row_get(row, "chatgpt_websocket_stability") != "auth-required"
+        ]
+        disconnects = sum(int(_row_get(row, "chatgpt_websocket_disconnects", 0) or 0) for row in items)
+        stable = states["stable"] + states["stable-after-reconnect"]
+        auth_required = states["auth-required"]
+        evaluated = len(items) - auth_required
+        output.append({
+            "provider": provider, "region": region, "candidates": len(items),
+            "evaluated": evaluated, "auth_required": auth_required,
+            "handshake_ok": sum(_row_get(row, "chatgpt_websocket") == "upgrade-101" for row in items),
+            "stable": states["stable"], "recovered": states["stable-after-reconnect"],
+            "unstable": states["unstable-disconnected"], "handshake_failed": states["handshake-failed"],
+            "disconnects": disconnects, "duration_p50": percentile(durations, .5),
+            "stable_rate": stable / evaluated * 100 if evaluated else None,
+        })
+    return sorted(output, key=lambda row: (row["region"], row["provider"]))
+
+
+def _websocket_summary_table(items: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| 地区 | Provider | 候选 | 有效测试 | 需凭据 | 握手成功 | 首次稳定 | 重连恢复 | 不稳定断开 | 握手失败 | 异常断开次数 | 最长连续时长 P50 | 最终稳定率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in items:
+        lines.append(
+            f"| {_cell(row['region'])} | {_cell(row['provider'])} | {row['candidates']} | "
+            f"{row['evaluated']} | {row['auth_required']} | {row['handshake_ok']} | "
+            f"{row['stable']} | {row['recovered']} | {row['unstable']} | "
+            f"{row['handshake_failed']} | {row['disconnects']} | {_f(row['duration_p50'], ' s')} | "
+            f"{_f(row['stable_rate'], '%')} |"
+        )
+    if not items:
+        lines.append("| — | — | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | — | — |")
+    return lines
+
+
 def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[str]:
     lines = [
-        "| Provider | 地区 | 节点 | 协议 | ChatGPT 结果 | 认证域名 | 静态资源 | WebSocket | 大流量测速 | 出口国家 | ASN |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Provider | 地区 | 节点 | 协议 | ChatGPT 基础结果 | 认证域名 | 静态资源 | WS 握手 | 最长连续时长 | 异常断开 | 重连 | WS 稳定性 | 大流量测速 | 出口国家 | ASN |",
+        "|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---|",
     ]
     found = False
     for row in rows:
@@ -94,11 +141,15 @@ def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[st
             f"{_cell(_dimension_value(row, 'proxy_type'))} | `{_cell(row['chatgpt'])}` | "
             f"`{_cell(_row_get(row, 'chatgpt_auth'))}` | `{_cell(_row_get(row, 'chatgpt_static'))}` | "
             f"`{_cell(_row_get(row, 'chatgpt_websocket'))}` | "
+            f"{_f(_row_get(row, 'chatgpt_websocket_seconds'), ' s')} | "
+            f"{_cell(_row_get(row, 'chatgpt_websocket_disconnects'))} | "
+            f"`{_cell(_row_get(row, 'chatgpt_websocket_reconnect'))}` | "
+            f"`{_cell(_row_get(row, 'chatgpt_websocket_stability'))}` | "
             f"{'旧数据' if _row_get(row, 'throughput_attempted') is None else '已执行' if bool(_row_get(row, 'throughput_attempted')) else '未执行'} | "
             f"{_cell(row['exit_country'])} | {_cell(row['asn'])} |"
         )
     if not found:
-        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — | — | — | — | — |")
+        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — | — | — | — | — | — | — | — | — |")
     return lines
 
 
@@ -322,6 +373,7 @@ def _conditions(run: sqlite3.Row) -> list[str]:
         f"- 文件大小：单阶段下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；两阶段通过节点下载 {params.get('two_stage_download_size_mb', '—')} MB / 上传 {params.get('two_stage_upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
         f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；并行 worker：{params.get('enrichment_workers', 1)}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
         f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
+        f"- ChatGPT WebSocket：通过 `/backend-api/register-websocket` 获取一次性签名地址；认证模式 {chatgpt_probe.get('websocket_auth_mode', 'legacy-unknown')}；目标保持 {chatgpt_probe.get('websocket_hold_seconds', '—')} 秒；异常断开后最多重连 {chatgpt_probe.get('websocket_reconnect_attempts', '—')} 次",
         f"- 评测时区：{params.get('evaluation_timezone', 'Asia/Shanghai')}（数据库原始时间仍保存为 UTC）",
         f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
         f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
@@ -347,7 +399,8 @@ def current_report(conn: sqlite3.Connection, run_id: str, timezone_name: str = "
     out += ["", "## 本次：Provider × 地区", "", *_summary_table(regional, ("provider", "region")),
             "", "## 本次：Provider × 地区 × 协议", "", *_summary_table(protocol, ("provider", "region", "proxy_type")),
             "", "## 本次 ChatGPT 可用性", "", *_chatgpt_summary_table(chatgpt_summary(rows)),
-            "", "> `available` 要求 ChatGPT 页面/后端、认证域名、静态资源域名及 Realtime WebSocket 认证边界全部可达。认证域名返回 401/403、WebSocket 在未提供 API key 时返回 401/403 都可证明网络路径可达，但不能证明账号登录或真实对话成功。", "",
+            "", "> `available` 只表示第一阶段的 ChatGPT 页面/后端、认证域名和静态资源基础路径可达。WebSocket 稳定性是第二阶段的独立结论；单次 `upgrade-101` 不等同于稳定可用。", "",
+            "## 本次 ChatGPT WebSocket 稳定性", "", *_websocket_summary_table(websocket_summary(rows)), "",
             *_chatgpt_node_table(rows),
             "", "## 本次基础设施多样性", "", *_infra_table(infrastructure_summary(rows)), "", "## 本次异常", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
@@ -377,7 +430,8 @@ def trend_report(
            "## 对比条件", "", *_conditions(anchor), "", "## Provider × 地区趋势", "",
            *_summary_table(regional, ("provider", "region")), "", "## Provider × 地区 × 协议趋势", "",
            *_summary_table(protocol, ("provider", "region", "proxy_type")), "", "## ChatGPT 可用性趋势", "",
-           *_chatgpt_summary_table(chatgpt_summary(rows)), "", "## 基础设施多样性（每节点取窗口内最新观测）", "",
+           *_chatgpt_summary_table(chatgpt_summary(rows)), "", "## ChatGPT WebSocket 稳定性趋势", "",
+           *_websocket_summary_table(websocket_summary(rows)), "", "## 基础设施多样性（每节点取窗口内最新观测）", "",
            *_infra_table(infrastructure_summary(rows)), "", "## 异常", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
     out += ["", "## 历史条件清单（各组不互相混合）", "", "| 条件 ID | 全部运行 | 完整运行 |", "|---|---:|---:|"]
@@ -396,7 +450,8 @@ def _methodology() -> list[str]:
         "- 晚高峰按报告配置的评测时区计算，为 20:00–23:59；日间基准为 09:00 与 14:00。默认评测时区是 Asia/Shanghai，括号显示晚高峰/日间有效下载样本数；负衰减表示晚高峰反而更快。",
         "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
         "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
-        "- ChatGPT 可用率的分母是实际完成 ChatGPT 检测的样本，只把所有页面/后端、认证、静态资源和 WebSocket 子检查均可达的 `available` 计为可用；地区不支持、Cloudflare challenge、明确阻断、限流和网络错误均不计为可用。它是未登录网络可达性检查，不使用或验证你的 ChatGPT 账号。",
+        "- ChatGPT 基础可用率的分母是实际完成第一阶段检查的样本，只把页面/后端、认证域名和静态资源均可达的 `available` 计为可用。它不包含 WebSocket 稳定性，也不使用或验证你的 ChatGPT 账号。",
+        "- WebSocket 只在两阶段模式的候选节点上检测。未配置 ChatGPT Web access token 时标为 `auth-required`，不混入有效测试数和稳定率；配置后，程序调用 ChatGPT 网页的 `backend-api/register-websocket` 获取一次性签名地址，验证 101 握手后定期发送 WebSocket Ping，并保持配置时长。提前关闭或网络异常记为异常断开；重连会重新注册地址。时长字段记录各次连接中最长的一次连续存活时间，不把多次连接相加。`stable` 表示首次连接保持到阈值，`stable-after-reconnect` 表示断开后重连恢复，`unstable-disconnected` 和 `handshake-failed` 均不算稳定。",
     ]
 
 

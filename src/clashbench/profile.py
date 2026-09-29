@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import urllib.parse
 from typing import Any
@@ -32,6 +33,9 @@ def benchmark_profile(
         enrichment_checks = []
     endpoint_value = str(engine.get("server_url", "https://speed.cloudflare.com"))
     endpoint_query = urllib.parse.urlsplit(endpoint_value).query
+    chatgpt_token_env = str(enrichment.get(
+        "chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN",
+    ))
     parameters = {
         "adapter": str(engine.get("adapter", "faceair")),
         "engine_version": engine_version,
@@ -59,8 +63,16 @@ def benchmark_profile(
             "client": "curl_cffi", "version": curl_cffi.__version__, "impersonate": "chrome",
             "endpoints": [
                 "chatgpt.com homepage", "chatgpt.com/backend-api/me", "auth.openai.com",
-                "cdn.oaistatic.com", "api.openai.com realtime WebSocket",
+                "cdn.oaistatic.com", "chatgpt.com/backend-api/register-websocket",
+                "registered ChatGPT web WebSocket",
             ],
+            "websocket_hold_seconds": int(enrichment.get("websocket_hold_seconds", 15)),
+            "websocket_reconnect_attempts": int(
+                enrichment.get("websocket_reconnect_attempts", 1)
+            ),
+            "websocket_auth_mode": (
+                "access-token" if os.environ.get(chatgpt_token_env) else "not-configured"
+            ),
         } if "chatgpt" in {str(value).lower() for value in enrichment_checks} else None,
         "evaluation_timezone": str(settings.report.get("timezone", "Asia/Shanghai")),
         "platform": platform.system(),

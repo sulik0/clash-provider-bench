@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import time
 import urllib.error
@@ -36,7 +38,15 @@ class ChatGPTProbeResult:
     overall: str
     auth: str
     static: str
-    websocket: str
+
+
+@dataclass(frozen=True)
+class WebSocketStabilityResult:
+    handshake: str
+    connected_seconds: float
+    abnormal_disconnects: int
+    reconnect: str
+    stability: str
 
 
 def classify_chatgpt_response(
@@ -103,6 +113,7 @@ class MihomoEnricher:
     def __init__(
         self, binary: str, runtime: Path, source_config: Path, unlock: bool = False, timeout: int = 15,
         checks: Iterable[str] | None = None, chatgpt_unsupported_countries: Iterable[str] = (),
+        chatgpt_access_token: str | None = None,
     ):
         self.binary = binary
         self.runtime = runtime / "mihomo"
@@ -117,6 +128,7 @@ class MihomoEnricher:
         self.chatgpt_unsupported_countries = {
             str(value).upper() for value in chatgpt_unsupported_countries
         }
+        self.chatgpt_access_token = chatgpt_access_token or None
         self.mixed_port = _free_port()
         self.controller_port = _free_port()
         while self.controller_port == self.mixed_port:
@@ -191,11 +203,13 @@ class MihomoEnricher:
 
     def _browser_proxied(
         self, url: str, limit: int, session: browser_requests.Session,
+        *, method: str = "GET", headers: dict[str, str] | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
         """Request through Mihomo with a real Chrome TLS/HTTP2 fingerprint."""
         proxy = f"http://127.0.0.1:{self.mixed_port}"
-        response = session.get(
-            url, proxy=proxy, timeout=self.timeout, allow_redirects=True,
+        response = session.request(
+            method, url, proxy=proxy, timeout=self.timeout, allow_redirects=True,
+            headers=headers,
         )
         try:
             return response.status_code, response.content[:limit], dict(response.headers.items())
@@ -250,7 +264,6 @@ class MihomoEnricher:
                         item.chatgpt = result.overall
                         item.chatgpt_auth = result.auth
                         item.chatgpt_static = result.static
-                        item.chatgpt_websocket = result.websocket
                     else:  # Compatibility for custom/mock enrichers returning the legacy string.
                         item.chatgpt = result
                 except Exception as exc:
@@ -281,55 +294,252 @@ class MihomoEnricher:
             if progress:
                 progress(index, total, item, "done")
 
-    def _websocket_probe(self) -> str:
-        """Reach OpenAI's Realtime WebSocket authentication boundary via Mihomo.
-
-        No API key is sent. HTTP 401/403 therefore confirms the CONNECT, TLS and
-        WebSocket upgrade request reached OpenAI; 101 is accepted if an upstream
-        deployment ever permits an unauthenticated upgrade.
-        """
-        target = "api.openai.com"
-        sock = socket.create_connection(("127.0.0.1", self.mixed_port), timeout=self.timeout)
+    def _register_chatgpt_websocket(
+        self, session: browser_requests.Session,
+    ) -> tuple[str | None, str]:
+        """Obtain ChatGPT web's short-lived signed WebSocket URL without logging it."""
+        status, raw, headers = self._browser_proxied(
+            "https://chatgpt.com/backend-api/register-websocket", 128_000, session,
+            method="POST", headers={
+                "Accept": "application/json", "Origin": "https://chatgpt.com",
+                "Referer": "https://chatgpt.com/", "Authorization": (
+                    f"Bearer {self.chatgpt_access_token}"
+                    if self.chatgpt_access_token else ""
+                ),
+            },
+        )
+        if status == 401 and not self.chatgpt_access_token:
+            return None, "auth-required"
+        reachable = classify_reachability_response(status, raw, headers)
+        if status != 200:
+            return None, f"registration-{reachable}"
         try:
-            sock.settimeout(self.timeout)
-            sock.sendall(
-                f"CONNECT {target}:443 HTTP/1.1\r\nHost: {target}:443\r\n"
+            websocket_url = str(json.loads(raw).get("wss_url") or "")
+        except (json.JSONDecodeError, AttributeError):
+            return None, "registration-invalid-json"
+        parsed = urllib.parse.urlsplit(websocket_url)
+        host = (parsed.hostname or "").lower()
+        allowed_host = (
+            host == "chatgpt.com" or host.endswith(".chatgpt.com")
+            or host.endswith(".webpubsub.azure.com")
+        )
+        if parsed.scheme != "wss" or not host or not allowed_host:
+            return None, "registration-invalid-target"
+        return websocket_url, "registered"
+
+    @staticmethod
+    def _send_websocket_frame(sock: ssl.SSLSocket, opcode: int, payload: bytes = b"") -> None:
+        mask = secrets.token_bytes(4)
+        length = len(payload)
+        header = bytearray([0x80 | opcode])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65_536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        sock.sendall(bytes(header) + mask + masked)
+
+    @staticmethod
+    def _recv_websocket_frame(
+        sock: ssl.SSLSocket, buffered: bytes,
+    ) -> tuple[int, bytes, bytes]:
+        def take(count: int, value: bytes) -> tuple[bytes, bytes]:
+            while len(value) < count:
+                chunk = sock.recv(max(4096, count - len(value)))
+                if not chunk:
+                    raise ConnectionError("websocket closed")
+                value += chunk
+            return value[:count], value[count:]
+
+        header, buffered = take(2, buffered)
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            raw_length, buffered = take(2, buffered)
+            length = struct.unpack("!H", raw_length)[0]
+        elif length == 127:
+            raw_length, buffered = take(8, buffered)
+            length = struct.unpack("!Q", raw_length)[0]
+        if length > 2_000_000:
+            raise ValueError("websocket frame too large")
+        mask = b""
+        if masked:
+            mask, buffered = take(4, buffered)
+        payload, buffered = take(length, buffered)
+        if masked:
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        return opcode, payload, buffered
+
+    def _open_chatgpt_websocket(
+        self, websocket_url: str,
+    ) -> tuple[ssl.SSLSocket | None, str, bytes]:
+        parsed = urllib.parse.urlsplit(websocket_url)
+        target = parsed.hostname or ""
+        port = parsed.port or 443
+        raw_sock: socket.socket | None = socket.create_connection(
+            ("127.0.0.1", self.mixed_port), timeout=self.timeout,
+        )
+        tls: ssl.SSLSocket | None = None
+        try:
+            raw_sock.settimeout(self.timeout)
+            raw_sock.sendall(
+                f"CONNECT {target}:{port} HTTP/1.1\r\nHost: {target}:{port}\r\n"
                 "Proxy-Connection: keep-alive\r\n\r\n".encode()
             )
             response = b""
             while b"\r\n\r\n" not in response and len(response) < 64_000:
-                chunk = sock.recv(4096)
+                chunk = raw_sock.recv(4096)
                 if not chunk:
                     break
                 response += chunk
             first = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
             if " 200 " not in first:
-                return f"proxy-{first or 'no-response'}"
-            with TLS.wrap_socket(sock, server_hostname=target) as tls:
-                key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-                request = (
-                    "GET /v1/realtime?model=gpt-realtime HTTP/1.1\r\n"
-                    f"Host: {target}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
-                    "OpenAI-Beta: realtime=v1\r\nUser-Agent: clash-provider-bench\r\n\r\n"
-                )
-                tls.sendall(request.encode("ascii"))
-                raw = b""
-                while b"\r\n\r\n" not in raw and len(raw) < 64_000:
-                    chunk = tls.recv(4096)
-                    if not chunk:
-                        break
-                    raw += chunk
-            match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", raw)
+                return None, f"proxy-{first or 'no-response'}", b""
+            tls = TLS.wrap_socket(raw_sock, server_hostname=target)
+            raw_sock = None
+            key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+            path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            request = (
+                f"GET {path} HTTP/1.1\r\nHost: {target}\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Protocol: json.reliable.webpubsub.azure.v1\r\n"
+                "Origin: https://chatgpt.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+            )
+            tls.sendall(request.encode("ascii"))
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 64_000:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            header, _, buffered = response.partition(b"\r\n\r\n")
+            match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", header)
             if not match:
-                return "invalid-response"
+                tls.close()
+                return None, "invalid-response", b""
             status = int(match.group(1))
-            return "reachable:upgrade-101" if status == 101 else classify_reachability_response(status, raw)
+            if status != 101:
+                tls.close()
+                return None, f"http-{status}", b""
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()).decode("ascii")
+            header_text = header.decode("latin-1", "replace")
+            response_headers = {
+                name.strip().lower(): value.strip()
+                for line in header_text.split("\r\n")[1:]
+                if ":" in line
+                for name, value in (line.split(":", 1),)
+            }
+            if response_headers.get("sec-websocket-accept") != expected:
+                tls.close()
+                return None, "invalid-accept", b""
+            if response_headers.get("sec-websocket-protocol") != (
+                "json.reliable.webpubsub.azure.v1"
+            ):
+                tls.close()
+                return None, "invalid-subprotocol", b""
+            return tls, "upgrade-101", buffered
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if raw_sock is not None:
+                raw_sock.close()
+
+    def _hold_chatgpt_websocket(
+        self, sock: ssl.SSLSocket, buffered: bytes, hold_seconds: int,
+    ) -> tuple[float, bool]:
+        started = time.monotonic()
+        next_ping = started + min(5, max(1, hold_seconds / 2))
+        try:
+            while True:
+                elapsed = time.monotonic() - started
+                if elapsed >= hold_seconds:
+                    try:
+                        self._send_websocket_frame(sock, 0x8, struct.pack("!H", 1000))
+                    except OSError:
+                        pass
+                    return elapsed, True
+                if time.monotonic() >= next_ping:
+                    self._send_websocket_frame(sock, 0x9, b"clashbench")
+                    next_ping = time.monotonic() + 5
+                sock.settimeout(min(1.0, max(0.1, hold_seconds - elapsed)))
+                try:
+                    opcode, payload, buffered = self._recv_websocket_frame(sock, buffered)
+                except socket.timeout:
+                    continue
+                if opcode == 0x8:
+                    return time.monotonic() - started, False
+                if opcode == 0x9:
+                    self._send_websocket_frame(sock, 0xA, payload)
+        except (ConnectionError, OSError, ssl.SSLError, ValueError):
+            return time.monotonic() - started, False
+        finally:
+            sock.close()
+
+    def _websocket_stability(
+        self, hold_seconds: int, reconnect_attempts: int,
+    ) -> WebSocketStabilityResult:
+        if not self.chatgpt_access_token:
+            return WebSocketStabilityResult(
+                "auth-required", 0.0, 0, "not-attempted", "auth-required",
+            )
+        session = browser_requests.Session(impersonate="chrome")
+        longest_connected = 0.0
+        disconnects = 0
+        try:
+            websocket_url, registration = self._register_chatgpt_websocket(session)
+            if not websocket_url:
+                return WebSocketStabilityResult(
+                    registration, 0.0, 0, "not-attempted",
+                    "auth-required" if registration == "auth-required" else "handshake-failed",
+                )
+            sock, handshake, buffered = self._open_chatgpt_websocket(websocket_url)
+            if not sock:
+                return WebSocketStabilityResult(
+                    handshake, 0.0, 0, "not-attempted", "handshake-failed",
+                )
+            connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
+            longest_connected = max(longest_connected, connected)
+            if survived:
+                return WebSocketStabilityResult(
+                    handshake, round(longest_connected, 1), 0, "not-needed", "stable",
+                )
+            disconnects += 1
+            if reconnect_attempts <= 0:
+                return WebSocketStabilityResult(
+                    handshake, round(longest_connected, 1), disconnects, "disabled",
+                    "unstable-disconnected",
+                )
+            last_reconnect = "failed"
+            for attempt in range(1, reconnect_attempts + 1):
+                websocket_url, registration = self._register_chatgpt_websocket(session)
+                if not websocket_url:
+                    last_reconnect = f"failed:{registration}"
+                    continue
+                sock, reconnect_handshake, buffered = self._open_chatgpt_websocket(websocket_url)
+                if not sock:
+                    last_reconnect = f"failed:{reconnect_handshake}"
+                    continue
+                connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
+                longest_connected = max(longest_connected, connected)
+                if survived:
+                    return WebSocketStabilityResult(
+                        handshake, round(longest_connected, 1), disconnects,
+                        f"succeeded:{attempt}", "stable-after-reconnect",
+                    )
+                disconnects += 1
+                last_reconnect = f"disconnected:{attempt}"
+            return WebSocketStabilityResult(
+                handshake, round(longest_connected, 1), disconnects, last_reconnect,
+                "unstable-disconnected",
+            )
+        finally:
+            session.close()
 
     def _chatgpt(self, location: str | None = None) -> ChatGPTProbeResult:
         # A fresh session per node prevents cookies and pooled proxy connections
@@ -349,7 +559,7 @@ class MihomoEnricher:
                 status, raw, headers, location, self.chatgpt_unsupported_countries,
             )
             if not homepage.startswith("available"):
-                return ChatGPTProbeResult(homepage, "not-run", "not-run", "not-run")
+                return ChatGPTProbeResult(homepage, "not-run", "not-run")
 
             # A page shell can load even when the ChatGPT backend is challenged. An
             # unauthenticated backend response (normally 401/403) proves reachability
@@ -363,14 +573,14 @@ class MihomoEnricher:
             )
             backend_text = backend_raw.decode("utf-8", "replace").lower()
             if backend.startswith(("challenge", "unsupported-country", "rate-limited")):
-                return ChatGPTProbeResult(backend, "not-run", "not-run", "not-run")
+                return ChatGPTProbeResult(backend, "not-run", "not-run")
             if backend.startswith("blocked") and any(marker in backend_text for marker in (
                 "sorry, you have been blocked", "access denied", "you are unable to access chatgpt.com",
             )):
-                return ChatGPTProbeResult(backend, "not-run", "not-run", "not-run")
+                return ChatGPTProbeResult(backend, "not-run", "not-run")
             if backend_status >= 500:
                 overall = f"backend-http-{backend_status}{':' + location.upper() if location else ''}"
-                return ChatGPTProbeResult(overall, "not-run", "not-run", "not-run")
+                return ChatGPTProbeResult(overall, "not-run", "not-run")
 
             try:
                 auth = classify_reachability_response(*self._browser_proxied(
@@ -384,19 +594,51 @@ class MihomoEnricher:
                 ))
             except Exception as exc:
                 static = f"error:{type(exc).__name__}"
-            try:
-                websocket = self._websocket_probe()
-            except Exception as exc:
-                websocket = f"error:{type(exc).__name__}"
             overall = homepage
-            for name, result in (("auth", auth), ("static", static), ("websocket", websocket)):
+            for name, result in (("auth", auth), ("static", static)):
                 if not result.startswith("reachable:"):
                     suffix = f":{location.upper()}" if location else ""
                     overall = f"{name}-{result}{suffix}"
                     break
-            return ChatGPTProbeResult(overall, auth, static, websocket)
+            return ChatGPTProbeResult(overall, auth, static)
         finally:
             session.close()
+
+    def probe_websocket_stability(
+        self, values: list[Measurement], hold_seconds: int, reconnect_attempts: int,
+        progress: Callable[[int, int, Measurement, str], None] | None = None,
+    ) -> None:
+        total = len(values)
+        for index, item in enumerate(values, 1):
+            if progress:
+                progress(index, total, item, "start")
+            try:
+                name = urllib.parse.quote("GLOBAL", safe="")
+                self._api("PUT", f"/proxies/{name}", {"name": item.node_name})
+                time.sleep(.15)
+                result = self._websocket_stability(hold_seconds, reconnect_attempts)
+                item.chatgpt_websocket = result.handshake
+                item.chatgpt_websocket_seconds = result.connected_seconds
+                item.chatgpt_websocket_disconnects = result.abnormal_disconnects
+                item.chatgpt_websocket_reconnect = result.reconnect
+                item.chatgpt_websocket_stability = result.stability
+                if result.stability not in {
+                    "stable", "stable-after-reconnect", "auth-required",
+                }:
+                    detail = f"websocket:{result.stability}"
+                    item.enrichment_error = ";".join(filter(None, (item.enrichment_error, detail)))
+                    item.enrichment_status = "partial" if item.enrichment_status == "ok" else item.enrichment_status
+            except Exception as exc:
+                item.chatgpt_websocket = f"error:{type(exc).__name__}"
+                item.chatgpt_websocket_seconds = 0.0
+                item.chatgpt_websocket_disconnects = 0
+                item.chatgpt_websocket_reconnect = "not-attempted"
+                item.chatgpt_websocket_stability = "handshake-failed"
+                detail = f"websocket:{type(exc).__name__}"
+                item.enrichment_error = ";".join(filter(None, (item.enrichment_error, detail)))
+                item.enrichment_status = "partial" if item.enrichment_status == "ok" else item.enrichment_status
+            if progress:
+                progress(index, total, item, "done")
 
     def _simple_unlock(self, url: str) -> str:
         status, _, _ = self._proxied(url, 128_000)
@@ -415,6 +657,7 @@ class MihomoEnricherPool:
         self, binary: str, runtime: Path, source_config: Path, unlock: bool = False,
         timeout: int = 15, checks: Iterable[str] | None = None,
         chatgpt_unsupported_countries: Iterable[str] = (), workers: int = 1,
+        chatgpt_access_token: str | None = None,
     ):
         self.binary = binary
         self.runtime = runtime
@@ -424,6 +667,7 @@ class MihomoEnricherPool:
         self.requested_checks = checks
         self.chatgpt_unsupported_countries = tuple(chatgpt_unsupported_countries)
         self.requested_workers = max(1, int(workers))
+        self.chatgpt_access_token = chatgpt_access_token or None
         self._stack: ExitStack | None = None
         self._workers: list[MihomoEnricher] = []
         self.startup_errors: list[str] = []
@@ -442,6 +686,7 @@ class MihomoEnricherPool:
                     self.binary, worker_runtime, self.source_config, self.unlock,
                     self.timeout, self.requested_checks,
                     self.chatgpt_unsupported_countries,
+                    self.chatgpt_access_token,
                 )
                 # Start workers one at a time. This lets each Mihomo bind its ports
                 # before another worker asks the OS for ephemeral ports.
@@ -490,6 +735,44 @@ class MihomoEnricherPool:
         ) as executor:
             futures = [
                 executor.submit(worker.enrich, chunk, pooled_progress)
+                for worker, chunk in zip(self._workers, chunks)
+                if chunk
+            ]
+            for future in futures:
+                future.result()
+
+    def probe_websocket_stability(
+        self, values: list[Measurement], hold_seconds: int, reconnect_attempts: int,
+        progress: Callable[[int, int, Measurement, str], None] | None = None,
+    ) -> None:
+        if not self._workers:
+            raise RuntimeError("Mihomo enrichment pool is not running")
+        if len(self._workers) == 1 or len(values) <= 1:
+            self._workers[0].probe_websocket_stability(
+                values, hold_seconds, reconnect_attempts, progress,
+            )
+            return
+
+        chunks = [values[index::len(self._workers)] for index in range(len(self._workers))]
+        counters = {"start": 0, "finish": 0}
+        lock = Lock()
+
+        def pooled_progress(_index: int, _count: int, item: Measurement, phase: str) -> None:
+            if not progress:
+                return
+            with lock:
+                key = "start" if phase == "start" else "finish"
+                counters[key] += 1
+                progress(counters[key], len(values), item, phase)
+
+        with ThreadPoolExecutor(
+            max_workers=len(self._workers), thread_name_prefix="clashbench-websocket",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    worker.probe_websocket_stability, chunk, hold_seconds,
+                    reconnect_attempts, pooled_progress,
+                )
                 for worker, chunk in zip(self._workers, chunks)
                 if chunk
             ]

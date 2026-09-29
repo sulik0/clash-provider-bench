@@ -75,6 +75,18 @@ def load_config(path: str | Path) -> Settings:
     if not 1 <= workers <= 16:
         raise ValueError("enrichment.workers must be between 1 and 16")
     enrichment["workers"] = workers
+    websocket_hold_seconds = int(enrichment.get("websocket_hold_seconds", 15))
+    if not 5 <= websocket_hold_seconds <= 120:
+        raise ValueError("enrichment.websocket_hold_seconds must be between 5 and 120")
+    enrichment["websocket_hold_seconds"] = websocket_hold_seconds
+    websocket_reconnect_attempts = int(enrichment.get("websocket_reconnect_attempts", 1))
+    if not 0 <= websocket_reconnect_attempts <= 3:
+        raise ValueError("enrichment.websocket_reconnect_attempts must be between 0 and 3")
+    enrichment["websocket_reconnect_attempts"] = websocket_reconnect_attempts
+    token_env = str(enrichment.get("chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN")).strip()
+    if not token_env:
+        raise ValueError("enrichment.chatgpt_access_token_env must not be empty")
+    enrichment["chatgpt_access_token_env"] = token_env
     notification = dict(raw.get("notification", {}))
     notification_mode = str(notification.get("mode", "macos")).lower()
     if notification_mode not in {"macos"}:

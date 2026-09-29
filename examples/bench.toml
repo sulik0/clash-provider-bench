@@ -44,6 +44,13 @@ timeout_seconds = 15
 # Each worker owns a separate Mihomo process, so selectors and proxy sessions do
 # not leak across nodes. Four workers make the HTTP-only enrichment phase much faster.
 workers = 4
+# Two-stage mode keeps ChatGPT's signed web WebSocket open for 15 seconds.
+# If it drops early, obtain a new signed URL and retry once.
+websocket_hold_seconds = 15
+websocket_reconnect_attempts = 1
+# Optional: set this variable in examples/.env to test the authenticated ChatGPT
+# WebSocket transport. The token is used in memory only and is never persisted.
+chatgpt_access_token_env = "CHATGPT_ACCESS_TOKEN"
 # ChatGPT is the primary goal. Skip YouTube/Netflix to reduce per-node runtime.
 unlock = true
 checks = ["chatgpt"]

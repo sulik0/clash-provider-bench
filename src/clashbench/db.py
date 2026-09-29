@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS measurements (
   asn TEXT, as_org TEXT, chatgpt TEXT, youtube TEXT, netflix TEXT, raw_json TEXT NOT NULL,
   enrichment_status TEXT NOT NULL DEFAULT 'legacy-unknown', enrichment_error TEXT,
   chatgpt_auth TEXT, chatgpt_static TEXT, chatgpt_websocket TEXT,
+  chatgpt_websocket_seconds REAL, chatgpt_websocket_disconnects INTEGER,
+  chatgpt_websocket_reconnect TEXT, chatgpt_websocket_stability TEXT,
   throughput_attempted INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_measurements_time ON measurements(tested_at);
@@ -52,6 +54,10 @@ MEASUREMENT_MIGRATIONS = {
     "chatgpt_auth": "TEXT",
     "chatgpt_static": "TEXT",
     "chatgpt_websocket": "TEXT",
+    "chatgpt_websocket_seconds": "REAL",
+    "chatgpt_websocket_disconnects": "INTEGER",
+    "chatgpt_websocket_reconnect": "TEXT",
+    "chatgpt_websocket_stability": "TEXT",
     "throughput_attempted": "INTEGER",
 }
 
@@ -141,15 +147,19 @@ def add_measurements(conn: sqlite3.Connection, run_id: str, values: Iterable[Mea
             item.upload_mbps, item.status, item.error, item.exit_ip, item.exit_country, item.exit_region,
             item.asn, item.as_org, item.chatgpt, item.youtube, item.netflix, json.dumps(raw, ensure_ascii=False),
             item.enrichment_status, item.enrichment_error, item.chatgpt_auth, item.chatgpt_static,
-            item.chatgpt_websocket,
+            item.chatgpt_websocket, item.chatgpt_websocket_seconds,
+            item.chatgpt_websocket_disconnects, item.chatgpt_websocket_reconnect,
+            item.chatgpt_websocket_stability,
             None if item.throughput_attempted is None else int(item.throughput_attempted)))
     conn.executemany(
         """INSERT INTO measurements (
         run_id,tested_at,provider,node_name,node_key,proxy_type,region,available,ttfb_ms,jitter_ms,
         packet_loss_pct,download_mbps,upload_mbps,status,error,exit_ip,exit_country,exit_region,asn,
         as_org,chatgpt,youtube,netflix,raw_json,enrichment_status,enrichment_error,chatgpt_auth,
-        chatgpt_static,chatgpt_websocket,throughput_attempted)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        chatgpt_static,chatgpt_websocket,chatgpt_websocket_seconds,
+        chatgpt_websocket_disconnects,chatgpt_websocket_reconnect,
+        chatgpt_websocket_stability,throughput_attempted)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
     conn.commit()
     return len(rows)
 
