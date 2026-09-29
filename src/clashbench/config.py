@@ -83,10 +83,14 @@ def load_config(path: str | Path) -> Settings:
     if not 0 <= websocket_reconnect_attempts <= 3:
         raise ValueError("enrichment.websocket_reconnect_attempts must be between 0 and 3")
     enrichment["websocket_reconnect_attempts"] = websocket_reconnect_attempts
-    token_env = str(enrichment.get("chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN")).strip()
-    if not token_env:
-        raise ValueError("enrichment.chatgpt_access_token_env must not be empty")
-    enrichment["chatgpt_access_token_env"] = token_env
+    api_key_env = str(enrichment.get("openai_api_key_env", "OPENAI_API_KEY")).strip()
+    if not api_key_env:
+        raise ValueError("enrichment.openai_api_key_env must not be empty")
+    enrichment["openai_api_key_env"] = api_key_env
+    realtime_model = str(enrichment.get("realtime_model", "gpt-realtime-2.1")).strip()
+    if not realtime_model:
+        raise ValueError("enrichment.realtime_model must not be empty")
+    enrichment["realtime_model"] = realtime_model
     notification = dict(raw.get("notification", {}))
     notification_mode = str(notification.get("mode", "macos")).lower()
     if notification_mode not in {"macos"}:

@@ -183,8 +183,11 @@ def cmd_run(args) -> int:
                                 settings.enrichment.get("chatgpt_unsupported_countries", ()),
                                 worker_count,
                                 os.environ.get(str(settings.enrichment.get(
-                                    "chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN",
+                                    "openai_api_key_env", "OPENAI_API_KEY",
                                 ))),
+                                str(settings.enrichment.get(
+                                    "realtime_model", "gpt-realtime-2.1",
+                                )),
                             ) as enricher:
                                 checks = ",".join(sorted(enricher.checks)) or "仅出口信息"
                                 progress(
@@ -225,7 +228,8 @@ def cmd_run(args) -> int:
                                         )
                                         progress(
                                             prefix,
-                                            f"阶段 2/2：WebSocket 稳定性检测；保持 {hold_seconds} 秒；"
+                                            f"阶段 2/2：Realtime API WebSocket 检测；"
+                                            f"保持 {hold_seconds} 秒；"
                                             f"重连 {reconnect_attempts} 次",
                                         )
 
@@ -369,12 +373,16 @@ def cmd_doctor(args) -> int:
             f"websocket_hold={int(settings.enrichment.get('websocket_hold_seconds', 15))}s; "
             f"websocket_reconnects={int(settings.enrichment.get('websocket_reconnect_attempts', 1))}"
         )
-        token_env = str(settings.enrichment.get(
-            "chatgpt_access_token_env", "CHATGPT_ACCESS_TOKEN",
+        api_key_env = str(settings.enrichment.get(
+            "openai_api_key_env", "OPENAI_API_KEY",
         ))
         print(
-            "OK ChatGPT WebSocket credential: "
-            + ("configured" if os.environ.get(token_env) else "not configured (reports auth-required)")
+            "OK Realtime API credential: "
+            + (
+                "configured (stability test enabled)"
+                if os.environ.get(api_key_env)
+                else "not configured (authentication-boundary probe only)"
+            )
         )
         if not found:
             ok = False

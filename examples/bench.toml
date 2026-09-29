@@ -44,13 +44,13 @@ timeout_seconds = 15
 # Each worker owns a separate Mihomo process, so selectors and proxy sessions do
 # not leak across nodes. Four workers make the HTTP-only enrichment phase much faster.
 workers = 4
-# Two-stage mode keeps ChatGPT's signed web WebSocket open for 15 seconds.
-# If it drops early, obtain a new signed URL and retry once.
+# Two-stage mode tests the documented OpenAI Realtime API WebSocket fallback.
+# With OPENAI_API_KEY it holds the connection for 15 seconds; without a key it
+# only verifies that the selected node reaches the API authentication boundary.
 websocket_hold_seconds = 15
 websocket_reconnect_attempts = 1
-# Optional: set this variable in examples/.env to test the authenticated ChatGPT
-# WebSocket transport. The token is used in memory only and is never persisted.
-chatgpt_access_token_env = "CHATGPT_ACCESS_TOKEN"
+openai_api_key_env = "OPENAI_API_KEY"
+realtime_model = "gpt-realtime-2.1"
 # ChatGPT is the primary goal. Skip YouTube/Netflix to reduce per-node runtime.
 unlock = true
 checks = ["chatgpt"]

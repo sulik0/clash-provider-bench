@@ -113,7 +113,7 @@ class MihomoEnricher:
     def __init__(
         self, binary: str, runtime: Path, source_config: Path, unlock: bool = False, timeout: int = 15,
         checks: Iterable[str] | None = None, chatgpt_unsupported_countries: Iterable[str] = (),
-        chatgpt_access_token: str | None = None,
+        openai_api_key: str | None = None, realtime_model: str = "gpt-realtime-2.1",
     ):
         self.binary = binary
         self.runtime = runtime / "mihomo"
@@ -128,7 +128,8 @@ class MihomoEnricher:
         self.chatgpt_unsupported_countries = {
             str(value).upper() for value in chatgpt_unsupported_countries
         }
-        self.chatgpt_access_token = chatgpt_access_token or None
+        self.openai_api_key = openai_api_key or None
+        self.realtime_model = realtime_model
         self.mixed_port = _free_port()
         self.controller_port = _free_port()
         while self.controller_port == self.mixed_port:
@@ -294,39 +295,6 @@ class MihomoEnricher:
             if progress:
                 progress(index, total, item, "done")
 
-    def _register_chatgpt_websocket(
-        self, session: browser_requests.Session,
-    ) -> tuple[str | None, str]:
-        """Obtain ChatGPT web's short-lived signed WebSocket URL without logging it."""
-        status, raw, headers = self._browser_proxied(
-            "https://chatgpt.com/backend-api/register-websocket", 128_000, session,
-            method="POST", headers={
-                "Accept": "application/json", "Origin": "https://chatgpt.com",
-                "Referer": "https://chatgpt.com/", "Authorization": (
-                    f"Bearer {self.chatgpt_access_token}"
-                    if self.chatgpt_access_token else ""
-                ),
-            },
-        )
-        if status == 401 and not self.chatgpt_access_token:
-            return None, "auth-required"
-        reachable = classify_reachability_response(status, raw, headers)
-        if status != 200:
-            return None, f"registration-{reachable}"
-        try:
-            websocket_url = str(json.loads(raw).get("wss_url") or "")
-        except (json.JSONDecodeError, AttributeError):
-            return None, "registration-invalid-json"
-        parsed = urllib.parse.urlsplit(websocket_url)
-        host = (parsed.hostname or "").lower()
-        allowed_host = (
-            host == "chatgpt.com" or host.endswith(".chatgpt.com")
-            or host.endswith(".webpubsub.azure.com")
-        )
-        if parsed.scheme != "wss" or not host or not allowed_host:
-            return None, "registration-invalid-target"
-        return websocket_url, "registered"
-
     @staticmethod
     def _send_websocket_frame(sock: ssl.SSLSocket, opcode: int, payload: bytes = b"") -> None:
         mask = secrets.token_bytes(4)
@@ -375,12 +343,10 @@ class MihomoEnricher:
             payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
         return opcode, payload, buffered
 
-    def _open_chatgpt_websocket(
-        self, websocket_url: str,
-    ) -> tuple[ssl.SSLSocket | None, str, bytes]:
-        parsed = urllib.parse.urlsplit(websocket_url)
-        target = parsed.hostname or ""
-        port = parsed.port or 443
+    def _open_realtime_websocket(self) -> tuple[ssl.SSLSocket | None, str, bytes]:
+        """Open the documented Realtime API WebSocket through the selected node."""
+        target = "api.openai.com"
+        port = 443
         raw_sock: socket.socket | None = socket.create_connection(
             ("127.0.0.1", self.mixed_port), timeout=self.timeout,
         )
@@ -403,13 +369,16 @@ class MihomoEnricher:
             tls = TLS.wrap_socket(raw_sock, server_hostname=target)
             raw_sock = None
             key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-            path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            model = urllib.parse.quote(self.realtime_model, safe="")
+            authorization = (
+                f"Authorization: Bearer {self.openai_api_key}\r\n"
+                if self.openai_api_key else ""
+            )
             request = (
-                f"GET {path} HTTP/1.1\r\nHost: {target}\r\n"
+                f"GET /v1/realtime?model={model} HTTP/1.1\r\nHost: {target}\r\n"
                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
-                "Sec-WebSocket-Protocol: json.reliable.webpubsub.azure.v1\r\n"
-                "Origin: https://chatgpt.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+                f"{authorization}User-Agent: clash-provider-bench\r\n\r\n"
             )
             tls.sendall(request.encode("ascii"))
             response = b""
@@ -426,7 +395,11 @@ class MihomoEnricher:
             status = int(match.group(1))
             if status != 101:
                 tls.close()
-                return None, f"http-{status}", b""
+                result = (
+                    f"reachable:http-{status}" if status in (401, 403)
+                    else f"http-{status}"
+                )
+                return None, result, b""
             expected = base64.b64encode(hashlib.sha1(
                 (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
             ).digest()).decode("ascii")
@@ -440,11 +413,6 @@ class MihomoEnricher:
             if response_headers.get("sec-websocket-accept") != expected:
                 tls.close()
                 return None, "invalid-accept", b""
-            if response_headers.get("sec-websocket-protocol") != (
-                "json.reliable.webpubsub.azure.v1"
-            ):
-                tls.close()
-                return None, "invalid-subprotocol", b""
             return tls, "upgrade-101", buffered
         finally:
             if raw_sock is not None:
@@ -484,62 +452,57 @@ class MihomoEnricher:
     def _websocket_stability(
         self, hold_seconds: int, reconnect_attempts: int,
     ) -> WebSocketStabilityResult:
-        if not self.chatgpt_access_token:
-            return WebSocketStabilityResult(
-                "auth-required", 0.0, 0, "not-attempted", "auth-required",
-            )
-        session = browser_requests.Session(impersonate="chrome")
         longest_connected = 0.0
         disconnects = 0
-        try:
-            websocket_url, registration = self._register_chatgpt_websocket(session)
-            if not websocket_url:
-                return WebSocketStabilityResult(
-                    registration, 0.0, 0, "not-attempted",
-                    "auth-required" if registration == "auth-required" else "handshake-failed",
-                )
-            sock, handshake, buffered = self._open_chatgpt_websocket(websocket_url)
+        sock, handshake, buffered = self._open_realtime_websocket()
+        if not self.openai_api_key:
+            boundary = handshake == "upgrade-101" or handshake.startswith("reachable:http-")
+            if sock:
+                try:
+                    self._send_websocket_frame(sock, 0x8, struct.pack("!H", 1000))
+                except OSError:
+                    pass
+                finally:
+                    sock.close()
+            return WebSocketStabilityResult(
+                handshake, 0.0, 0, "not-attempted",
+                "api-auth-boundary" if boundary else "handshake-failed",
+            )
+        if not sock:
+            return WebSocketStabilityResult(
+                handshake, 0.0, 0, "not-attempted", "handshake-failed",
+            )
+        connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
+        longest_connected = max(longest_connected, connected)
+        if survived:
+            return WebSocketStabilityResult(
+                handshake, round(longest_connected, 1), 0, "not-needed", "stable",
+            )
+        disconnects += 1
+        if reconnect_attempts <= 0:
+            return WebSocketStabilityResult(
+                handshake, round(longest_connected, 1), disconnects, "disabled",
+                "unstable-disconnected",
+            )
+        last_reconnect = "failed"
+        for attempt in range(1, reconnect_attempts + 1):
+            sock, reconnect_handshake, buffered = self._open_realtime_websocket()
             if not sock:
-                return WebSocketStabilityResult(
-                    handshake, 0.0, 0, "not-attempted", "handshake-failed",
-                )
+                last_reconnect = f"failed:{reconnect_handshake}"
+                continue
             connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
             longest_connected = max(longest_connected, connected)
             if survived:
                 return WebSocketStabilityResult(
-                    handshake, round(longest_connected, 1), 0, "not-needed", "stable",
+                    handshake, round(longest_connected, 1), disconnects,
+                    f"succeeded:{attempt}", "stable-after-reconnect",
                 )
             disconnects += 1
-            if reconnect_attempts <= 0:
-                return WebSocketStabilityResult(
-                    handshake, round(longest_connected, 1), disconnects, "disabled",
-                    "unstable-disconnected",
-                )
-            last_reconnect = "failed"
-            for attempt in range(1, reconnect_attempts + 1):
-                websocket_url, registration = self._register_chatgpt_websocket(session)
-                if not websocket_url:
-                    last_reconnect = f"failed:{registration}"
-                    continue
-                sock, reconnect_handshake, buffered = self._open_chatgpt_websocket(websocket_url)
-                if not sock:
-                    last_reconnect = f"failed:{reconnect_handshake}"
-                    continue
-                connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
-                longest_connected = max(longest_connected, connected)
-                if survived:
-                    return WebSocketStabilityResult(
-                        handshake, round(longest_connected, 1), disconnects,
-                        f"succeeded:{attempt}", "stable-after-reconnect",
-                    )
-                disconnects += 1
-                last_reconnect = f"disconnected:{attempt}"
-            return WebSocketStabilityResult(
-                handshake, round(longest_connected, 1), disconnects, last_reconnect,
-                "unstable-disconnected",
-            )
-        finally:
-            session.close()
+            last_reconnect = f"disconnected:{attempt}"
+        return WebSocketStabilityResult(
+            handshake, round(longest_connected, 1), disconnects, last_reconnect,
+            "unstable-disconnected",
+        )
 
     def _chatgpt(self, location: str | None = None) -> ChatGPTProbeResult:
         # A fresh session per node prevents cookies and pooled proxy connections
@@ -623,7 +586,7 @@ class MihomoEnricher:
                 item.chatgpt_websocket_reconnect = result.reconnect
                 item.chatgpt_websocket_stability = result.stability
                 if result.stability not in {
-                    "stable", "stable-after-reconnect", "auth-required",
+                    "stable", "stable-after-reconnect", "api-auth-boundary",
                 }:
                     detail = f"websocket:{result.stability}"
                     item.enrichment_error = ";".join(filter(None, (item.enrichment_error, detail)))
@@ -657,7 +620,7 @@ class MihomoEnricherPool:
         self, binary: str, runtime: Path, source_config: Path, unlock: bool = False,
         timeout: int = 15, checks: Iterable[str] | None = None,
         chatgpt_unsupported_countries: Iterable[str] = (), workers: int = 1,
-        chatgpt_access_token: str | None = None,
+        openai_api_key: str | None = None, realtime_model: str = "gpt-realtime-2.1",
     ):
         self.binary = binary
         self.runtime = runtime
@@ -667,7 +630,8 @@ class MihomoEnricherPool:
         self.requested_checks = checks
         self.chatgpt_unsupported_countries = tuple(chatgpt_unsupported_countries)
         self.requested_workers = max(1, int(workers))
-        self.chatgpt_access_token = chatgpt_access_token or None
+        self.openai_api_key = openai_api_key or None
+        self.realtime_model = realtime_model
         self._stack: ExitStack | None = None
         self._workers: list[MihomoEnricher] = []
         self.startup_errors: list[str] = []
@@ -686,7 +650,7 @@ class MihomoEnricherPool:
                     self.binary, worker_runtime, self.source_config, self.unlock,
                     self.timeout, self.requested_checks,
                     self.chatgpt_unsupported_countries,
-                    self.chatgpt_access_token,
+                    self.openai_api_key, self.realtime_model,
                 )
                 # Start workers one at a time. This lets each Mihomo bind its ports
                 # before another worker asks the OS for ephemeral ports.

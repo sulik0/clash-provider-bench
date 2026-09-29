@@ -1,6 +1,6 @@
 # Clash Provider Bench
 
-Clash Provider Bench 是一个面向 macOS 的 Clash/Mihomo 订阅自动化评测工具。它复用 `faceair/clash-speedtest` 和 Mihomo，比较多个 provider 的网络质量，并重点区分 ChatGPT 基础网页可达、WebSocket 握手成功和长连接稳定。结果保存为 SQLite、CSV、Markdown 和 HTML，订阅 token 不写入日志或报告。
+Clash Provider Bench 是一个面向 macOS 的 Clash/Mihomo 订阅自动化评测工具。它复用 `faceair/clash-speedtest` 和 Mihomo，比较多个 provider 的网络质量，并重点检测 ChatGPT 页面、后端、认证与静态资源是否可达。可选的官方 Realtime API WebSocket 探测用于观察长连接网络质量，但不冒充 ChatGPT 网页内部协议。结果保存为 SQLite、CSV、Markdown 和 HTML，订阅 token 不写入日志或报告。
 
 测试原理、完整配置、统计口径和报告解读见 [详细说明](docs/guide.md)。
 
@@ -28,8 +28,8 @@ chmod 600 examples/.env
 ```dotenv
 TAISHAN_SUB_URL=https://example.com/your-secret-subscription
 COKECLOUD_SUB_URL=https://example.com/your-secret-subscription
-# 可选：启用需要账号态的 ChatGPT WebSocket 稳定性测试
-CHATGPT_ACCESS_TOKEN=
+# 可选：启用官方 Realtime API 的真实 101/保持/重连测试
+OPENAI_API_KEY=
 ```
 
 随后按需编辑 `examples/bench.toml` 中的 provider、地区和测速参数。本地配置文件也可以直接作为 provider：
