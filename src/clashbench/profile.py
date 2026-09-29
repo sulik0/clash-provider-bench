@@ -40,6 +40,11 @@ def benchmark_profile(
         "adapter": str(engine.get("adapter", "faceair")),
         "engine_version": engine_version,
         "test_strategy": str(engine.get("test_strategy", "single-stage")),
+        "two_stage_merge_strategy": (
+            "preserve-stage1-network-v1"
+            if str(engine.get("test_strategy", "single-stage")) == "two-stage"
+            else None
+        ),
         "speed_mode": str(engine.get("speed_mode", "full")),
         "server_url": safe_endpoint(endpoint_value),
         "server_query_hash": hashlib.sha256(endpoint_query.encode()).hexdigest()[:12] if endpoint_query else None,
@@ -66,13 +71,15 @@ def benchmark_profile(
                 "cdn.oaistatic.com", "api.openai.com/v1/realtime",
             ],
             "websocket_kind": "openai-realtime-api-fallback",
+            "websocket_validation": "session-created+ping-pong-v1",
             "realtime_model": str(enrichment.get("realtime_model", "gpt-realtime-2.1")),
             "websocket_hold_seconds": int(enrichment.get("websocket_hold_seconds", 15)),
             "websocket_reconnect_attempts": int(
                 enrichment.get("websocket_reconnect_attempts", 1)
             ),
             "websocket_auth_mode": (
-                "api-key" if os.environ.get(openai_api_key_env) else "auth-boundary-only"
+                "api-key" if os.environ.get(openai_api_key_env, "").strip()
+                else "auth-boundary-only"
             ),
         } if "chatgpt" in {str(value).lower() for value in enrichment_checks} else None,
         "evaluation_timezone": str(settings.report.get("timezone", "Asia/Shanghai")),

@@ -128,7 +128,9 @@ class MihomoEnricher:
         self.chatgpt_unsupported_countries = {
             str(value).upper() for value in chatgpt_unsupported_countries
         }
-        self.openai_api_key = openai_api_key or None
+        self.openai_api_key = (openai_api_key or "").strip() or None
+        if self.openai_api_key and any(char in self.openai_api_key for char in "\r\n"):
+            raise ValueError("OpenAI API key must not contain line breaks")
         self.realtime_model = realtime_model
         self.mixed_port = _free_port()
         self.controller_port = _free_port()
@@ -324,8 +326,17 @@ class MihomoEnricher:
             return value[:count], value[count:]
 
         header, buffered = take(2, buffered)
+        if header[0] & 0x70:
+            raise ValueError("websocket RSV bits are not supported")
+        fin = bool(header[0] & 0x80)
         opcode = header[0] & 0x0F
         masked = bool(header[1] & 0x80)
+        if masked:
+            raise ValueError("server websocket frames must not be masked")
+        if opcode not in {0x0, 0x1, 0x2, 0x8, 0x9, 0xA}:
+            raise ValueError("unknown websocket opcode")
+        if opcode >= 0x8 and not fin:
+            raise ValueError("fragmented websocket control frame")
         length = header[1] & 0x7F
         if length == 126:
             raw_length, buffered = take(2, buffered)
@@ -333,14 +344,11 @@ class MihomoEnricher:
         elif length == 127:
             raw_length, buffered = take(8, buffered)
             length = struct.unpack("!Q", raw_length)[0]
+        if opcode >= 0x8 and length > 125:
+            raise ValueError("websocket control frame too large")
         if length > 2_000_000:
             raise ValueError("websocket frame too large")
-        mask = b""
-        if masked:
-            mask, buffered = take(4, buffered)
         payload, buffered = take(length, buffered)
-        if masked:
-            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
         return opcode, payload, buffered
 
     def _open_realtime_websocket(self) -> tuple[ssl.SSLSocket | None, str, bytes]:
@@ -351,6 +359,7 @@ class MihomoEnricher:
             ("127.0.0.1", self.mixed_port), timeout=self.timeout,
         )
         tls: ssl.SSLSocket | None = None
+        returned = False
         try:
             raw_sock.settimeout(self.timeout)
             raw_sock.sendall(
@@ -363,6 +372,8 @@ class MihomoEnricher:
                 if not chunk:
                     break
                 response += chunk
+            if b"\r\n\r\n" not in response:
+                return None, "proxy-invalid-response", b""
             first = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
             if " 200 " not in first:
                 return None, f"proxy-{first or 'no-response'}", b""
@@ -387,14 +398,14 @@ class MihomoEnricher:
                 if not chunk:
                     break
                 response += chunk
+            if b"\r\n\r\n" not in response:
+                return None, "invalid-response", b""
             header, _, buffered = response.partition(b"\r\n\r\n")
             match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", header)
             if not match:
-                tls.close()
                 return None, "invalid-response", b""
             status = int(match.group(1))
             if status != 101:
-                tls.close()
                 result = (
                     f"reachable:http-{status}" if status in (401, 403)
                     else f"http-{status}"
@@ -411,29 +422,56 @@ class MihomoEnricher:
                 for name, value in (line.split(":", 1),)
             }
             if response_headers.get("sec-websocket-accept") != expected:
-                tls.close()
                 return None, "invalid-accept", b""
+            if response_headers.get("upgrade", "").lower() != "websocket":
+                return None, "invalid-upgrade", b""
+            connection_tokens = {
+                token.strip().lower()
+                for token in response_headers.get("connection", "").split(",")
+            }
+            if "upgrade" not in connection_tokens:
+                return None, "invalid-connection", b""
+            returned = True
             return tls, "upgrade-101", buffered
         finally:
             if raw_sock is not None:
                 raw_sock.close()
+            if tls is not None and not returned:
+                tls.close()
 
     def _hold_chatgpt_websocket(
         self, sock: ssl.SSLSocket, buffered: bytes, hold_seconds: int,
-    ) -> tuple[float, bool]:
+    ) -> tuple[float, str]:
+        """Verify that an authenticated Realtime session is actually usable."""
         started = time.monotonic()
         next_ping = started + min(5, max(1, hold_seconds / 2))
+        ping_payload: bytes | None = None
+        ping_sent_at: float | None = None
+        pong_confirmed = False
+        session_created = False
+        pong_timeout = min(5.0, max(1.0, hold_seconds / 2))
         try:
             while True:
                 elapsed = time.monotonic() - started
-                if elapsed >= hold_seconds:
+                if ping_sent_at is not None and not pong_confirmed:
+                    if time.monotonic() - ping_sent_at >= pong_timeout:
+                        return elapsed, "unresponsive"
+                if elapsed >= hold_seconds and session_created and ping_payload is None:
+                    ping_payload = secrets.token_bytes(8)
+                    self._send_websocket_frame(sock, 0x9, ping_payload)
+                    ping_sent_at = time.monotonic()
+                if elapsed >= hold_seconds and session_created and pong_confirmed:
                     try:
                         self._send_websocket_frame(sock, 0x8, struct.pack("!H", 1000))
                     except OSError:
                         pass
-                    return elapsed, True
-                if time.monotonic() >= next_ping:
-                    self._send_websocket_frame(sock, 0x9, b"clashbench")
+                    return elapsed, "stable"
+                if elapsed >= hold_seconds and not session_created and not buffered:
+                    return elapsed, "session-not-established"
+                if session_created and ping_payload is None and time.monotonic() >= next_ping:
+                    ping_payload = secrets.token_bytes(8)
+                    self._send_websocket_frame(sock, 0x9, ping_payload)
+                    ping_sent_at = time.monotonic()
                     next_ping = time.monotonic() + 5
                 sock.settimeout(min(1.0, max(0.1, hold_seconds - elapsed)))
                 try:
@@ -441,13 +479,37 @@ class MihomoEnricher:
                 except socket.timeout:
                     continue
                 if opcode == 0x8:
-                    return time.monotonic() - started, False
+                    return time.monotonic() - started, "disconnected"
                 if opcode == 0x9:
                     self._send_websocket_frame(sock, 0xA, payload)
-        except (ConnectionError, OSError, ssl.SSLError, ValueError):
-            return time.monotonic() - started, False
+                elif opcode == 0xA and ping_payload is not None and payload == ping_payload:
+                    pong_confirmed = True
+                elif opcode == 0x1:
+                    try:
+                        event = json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return time.monotonic() - started, "protocol-error"
+                    event_type = event.get("type") if isinstance(event, dict) else None
+                    if event_type == "session.created":
+                        session_created = True
+                    elif event_type == "error":
+                        return time.monotonic() - started, "service-error"
+        except ValueError:
+            return time.monotonic() - started, "protocol-error"
+        except (ConnectionError, OSError, ssl.SSLError):
+            return time.monotonic() - started, "disconnected"
         finally:
             sock.close()
+
+    @staticmethod
+    def _stability_from_hold(outcome: str) -> str:
+        return {
+            "disconnected": "unstable-disconnected",
+            "unresponsive": "unstable-unresponsive",
+            "service-error": "session-failed",
+            "session-not-established": "session-failed",
+            "protocol-error": "session-failed",
+        }.get(outcome, "session-failed")
 
     def _websocket_stability(
         self, hold_seconds: int, reconnect_attempts: int,
@@ -472,17 +534,18 @@ class MihomoEnricher:
             return WebSocketStabilityResult(
                 handshake, 0.0, 0, "not-attempted", "handshake-failed",
             )
-        connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
+        connected, outcome = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
         longest_connected = max(longest_connected, connected)
-        if survived:
+        if outcome == "stable":
             return WebSocketStabilityResult(
                 handshake, round(longest_connected, 1), 0, "not-needed", "stable",
             )
-        disconnects += 1
+        disconnects += int(outcome == "disconnected")
+        final_stability = self._stability_from_hold(outcome)
         if reconnect_attempts <= 0:
             return WebSocketStabilityResult(
                 handshake, round(longest_connected, 1), disconnects, "disabled",
-                "unstable-disconnected",
+                final_stability,
             )
         last_reconnect = "failed"
         for attempt in range(1, reconnect_attempts + 1):
@@ -490,18 +553,19 @@ class MihomoEnricher:
             if not sock:
                 last_reconnect = f"failed:{reconnect_handshake}"
                 continue
-            connected, survived = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
+            connected, outcome = self._hold_chatgpt_websocket(sock, buffered, hold_seconds)
             longest_connected = max(longest_connected, connected)
-            if survived:
+            if outcome == "stable":
                 return WebSocketStabilityResult(
                     handshake, round(longest_connected, 1), disconnects,
                     f"succeeded:{attempt}", "stable-after-reconnect",
                 )
-            disconnects += 1
-            last_reconnect = f"disconnected:{attempt}"
+            disconnects += int(outcome == "disconnected")
+            final_stability = self._stability_from_hold(outcome)
+            last_reconnect = f"{outcome}:{attempt}"
         return WebSocketStabilityResult(
             handshake, round(longest_connected, 1), disconnects, last_reconnect,
-            "unstable-disconnected",
+            final_stability,
         )
 
     def _chatgpt(self, location: str | None = None) -> ChatGPTProbeResult:

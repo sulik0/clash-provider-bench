@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import plistlib
@@ -57,6 +58,12 @@ def measurement(provider: str, name: str, proxy_type: str = "VLESS", region: str
     )
 
 
+def server_websocket_frame(opcode: int, payload: bytes) -> bytes:
+    if len(payload) >= 126:
+        raise ValueError("test helper only supports short frames")
+    return bytes((0x80 | opcode, len(payload))) + payload
+
+
 class CoreTests(unittest.TestCase):
     def test_regions(self):
         self.assertEqual(classify_region("🇯🇵 Tokyo 01"), "JP")
@@ -74,6 +81,20 @@ source_env = "DEMO_URL"
 checks = ["chatgpt", "not-a-service"]
 """, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Unknown enrichment checks"):
+                load_config(path)
+
+    def test_config_rejects_duplicate_provider_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bench.toml"
+            path.write_text("""
+[[providers]]
+name = "duplicate"
+source_env = "FIRST_URL"
+[[providers]]
+name = "duplicate"
+source_env = "SECOND_URL"
+""", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Provider names must be unique"):
                 load_config(path)
 
     def test_config_validates_report_timezone(self):
@@ -258,12 +279,19 @@ websocket_hold_seconds = 2
             {"provider": "a", "region": "JP", "chatgpt_websocket": "reachable:http-401",
              "chatgpt_websocket_seconds": 0.0, "chatgpt_websocket_disconnects": 0,
              "chatgpt_websocket_stability": "api-auth-boundary"},
+            {"provider": "a", "region": "JP", "chatgpt_websocket": "upgrade-101",
+             "chatgpt_websocket_seconds": 5.0, "chatgpt_websocket_disconnects": 0,
+             "chatgpt_websocket_stability": "session-failed"},
+            {"provider": "a", "region": "JP", "chatgpt_websocket": "upgrade-101",
+             "chatgpt_websocket_seconds": 8.0, "chatgpt_websocket_disconnects": 0,
+             "chatgpt_websocket_stability": "unstable-unresponsive"},
         ]
         summary = websocket_summary(rows)[0]
-        self.assertEqual((summary["candidates"], summary["evaluated"], summary["handshake_ok"]), (4, 3, 2))
+        self.assertEqual((summary["candidates"], summary["evaluated"], summary["handshake_ok"]), (6, 5, 4))
         self.assertEqual(summary["boundary_only"], 1)
         self.assertEqual((summary["stable"], summary["recovered"], summary["handshake_failed"]), (1, 1, 1))
-        self.assertAlmostEqual(summary["stable_rate"], 2 / 3 * 100)
+        self.assertEqual((summary["session_failed"], summary["unresponsive"]), (1, 1))
+        self.assertAlmostEqual(summary["stable_rate"], 2 / 5 * 100)
 
     def test_report_time_buckets_use_configured_timezone(self):
         rows = [{
@@ -309,6 +337,21 @@ websocket_hold_seconds = 2
         self.assertNotIn("sensitive-value", str(authenticated_params))
         self.assertEqual(
             anonymous_params["chatgpt_probe"]["websocket_auth_mode"], "auth-boundary-only",
+        )
+        self.assertEqual(
+            anonymous_params["chatgpt_probe"]["websocket_validation"],
+            "session-created+ping-pong-v1",
+        )
+        with patch.dict("os.environ", {"TEST_OPENAI_API_KEY": "   "}):
+            whitespace_key, whitespace_params = benchmark_profile(settings, ["JP"], "v1", env)
+        self.assertEqual(whitespace_key, anonymous_key)
+        self.assertEqual(
+            whitespace_params["chatgpt_probe"]["websocket_auth_mode"], "auth-boundary-only",
+        )
+        settings.engine["test_strategy"] = "two-stage"
+        _, two_stage_params = benchmark_profile(settings, ["JP"], "v1", env)
+        self.assertEqual(
+            two_stage_params["two_stage_merge_strategy"], "preserve-stage1-network-v1",
         )
 
     def test_current_report_isolated_and_trend_only_matches_profile(self):
@@ -427,19 +470,27 @@ websocket_hold_seconds = 2
                 openai_api_key="test-key",
             )
         with patch.object(enricher, "_open_realtime_websocket", return_value=(MagicMock(), "upgrade-101", b"")), \
-             patch.object(enricher, "_hold_chatgpt_websocket", return_value=(15.0, True)):
+             patch.object(enricher, "_hold_chatgpt_websocket", return_value=(15.0, "stable")):
             stable = enricher._websocket_stability(15, 1)
         self.assertEqual((stable.handshake, stable.stability, stable.reconnect), (
             "upgrade-101", "stable", "not-needed",
         ))
 
         with patch.object(enricher, "_open_realtime_websocket", return_value=(MagicMock(), "upgrade-101", b"")), \
-             patch.object(enricher, "_hold_chatgpt_websocket", side_effect=[(2.0, False), (15.0, True)]):
+             patch.object(enricher, "_hold_chatgpt_websocket", side_effect=[
+                 (2.0, "disconnected"), (15.0, "stable"),
+             ]):
             recovered = enricher._websocket_stability(15, 1)
         self.assertEqual(recovered.stability, "stable-after-reconnect")
         self.assertEqual(recovered.abnormal_disconnects, 1)
         self.assertEqual(recovered.reconnect, "succeeded:1")
         self.assertEqual(recovered.connected_seconds, 15.0)
+
+        with patch.object(enricher, "_open_realtime_websocket", return_value=(MagicMock(), "upgrade-101", b"")), \
+             patch.object(enricher, "_hold_chatgpt_websocket", return_value=(15.0, "service-error")):
+            session_failed = enricher._websocket_stability(15, 0)
+        self.assertEqual(session_failed.stability, "session-failed")
+        self.assertEqual(session_failed.abnormal_disconnects, 0)
 
         with patch.object(enricher, "_open_realtime_websocket", return_value=(None, "http-404", b"")):
             failed = enricher._websocket_stability(15, 1)
@@ -485,6 +536,48 @@ websocket_hold_seconds = 2
         self.assertIn("CONNECT api.openai.com:443", raw_request)
         self.assertIn("GET /v1/realtime?model=gpt-realtime-2.1", websocket_request)
         self.assertIn("Authorization: Bearer secret-key", websocket_request)
+        tls_sock.close.assert_called_once()
+
+        key = base64.b64encode(b"k" * 16).decode("ascii")
+        accepted = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        ).digest()).decode("ascii")
+        tls_sock = MagicMock()
+        tls_sock.recv.return_value = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accepted}\r\n\r\n"
+        ).encode("ascii")
+        with patch("clashbench.enrich.socket.create_connection", return_value=raw_sock), \
+             patch.object(TLS, "wrap_socket", return_value=tls_sock), \
+             patch("clashbench.enrich.secrets.token_bytes", return_value=b"k" * 16):
+            sock, state, buffered = enricher._open_realtime_websocket()
+        self.assertIs(sock, tls_sock)
+        self.assertEqual((state, buffered), ("upgrade-101", b""))
+        tls_sock.close.assert_not_called()
+
+    def test_realtime_websocket_requires_session_and_pong(self):
+        with patch("clashbench.enrich._free_port", side_effect=[18080, 19090]):
+            enricher = MihomoEnricher(
+                "missing", Path("/tmp/unused"), Path("/tmp/unused.yaml"),
+                openai_api_key="test-key",
+            )
+        sock = MagicMock()
+        sock.recv.return_value = server_websocket_frame(0xA, b"p" * 8)
+        session = server_websocket_frame(0x1, b'{"type":"session.created"}')
+        with patch("clashbench.enrich.secrets.token_bytes", side_effect=lambda size: b"p" * size):
+            _, outcome = enricher._hold_chatgpt_websocket(sock, session, 0)
+        self.assertEqual(outcome, "stable")
+        sock.close.assert_called_once()
+
+        service_error = server_websocket_frame(0x1, b'{"type":"error"}')
+        sock = MagicMock()
+        _, outcome = enricher._hold_chatgpt_websocket(sock, service_error, 0)
+        self.assertEqual(outcome, "service-error")
+        sock.close.assert_called_once()
+
+        with self.assertRaisesRegex(ValueError, "must not be masked"):
+            enricher._recv_websocket_frame(MagicMock(), bytes((0x81, 0x80)))
 
     def test_websocket_probe_fields_are_independent_from_base_chatgpt_result(self):
         item = measurement("a", "node")
@@ -509,11 +602,18 @@ websocket_hold_seconds = 2
         blocked.chatgpt = "challenge:JP"
         result = measurement("a", "passed", download=500)
         result.throughput_attempted = True
-        merge_two_stage([passed, blocked], [result])
+        failed = measurement("a", "failed", latency=70, download=None)
+        failed.chatgpt = "available:JP"
+        failed_result = measurement("a", "failed", available=False, latency=None, download=None)
+        merge_two_stage([passed, blocked, failed], [result, failed_result])
         self.assertTrue(passed.throughput_attempted)
         self.assertEqual(passed.download_mbps, 500)
         self.assertFalse(blocked.throughput_attempted)
         self.assertIsNone(blocked.download_mbps)
+        self.assertTrue(failed.available)
+        self.assertEqual(failed.ttfb_ms, 70)
+        self.assertEqual(failed.status, "failed")
+        self.assertTrue(failed.throughput_attempted)
 
     def test_mihomo_ports_are_distinct(self):
         with patch("clashbench.enrich._free_port", side_effect=[18080, 18080, 19090]):

@@ -113,7 +113,7 @@ chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 clashbench run --config examples/bench.toml --two-stage
 ```
 
-阶段 1 对全部节点运行 `fast` 模式，只取得延迟、抖动和丢包，再检查出口以及 ChatGPT 页面、后端、认证和静态资源基础路径。阶段 2 只对基础检查为 `available` 的候选节点执行两类测试：官方 OpenAI Realtime API WebSocket 探测，以及按配置的 `speed_mode` 和 50/20 MB 参数进行大流量测速。WebSocket 结果是补充网络指标，不会抹掉基础可达性，也不会阻止吞吐测速；未通过第一阶段的节点不会消耗大流量，也不会被计为吞吐失败。附加检测使用独立 Mihomo worker，不共享 `GLOBAL` 选择器、连接池或 Cookie。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 可保留为地区限制对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
+阶段 1 对全部节点运行 `fast` 模式，只取得延迟、抖动和丢包，再检查出口以及 ChatGPT 页面、后端、认证和静态资源基础路径。阶段 2 只对基础检查为 `available` 的候选节点执行两类测试：官方 OpenAI Realtime API WebSocket 探测，以及按配置的 `speed_mode` 和 50/20 MB 参数进行大流量测速。最终记录始终保留第一阶段的可用状态、延迟、抖动和丢包，第二阶段只合并下载/上传与吞吐成败，避免在同一份报告里混用两套基础指标口径。WebSocket 结果是补充网络指标，不会抹掉基础可达性，也不会阻止吞吐测速；未通过第一阶段的节点不会消耗大流量，也不会被计为吞吐失败。附加检测使用独立 Mihomo worker，不共享 `GLOBAL` 选择器、连接池或 Cookie。JP、SG、US 适合作为 ChatGPT 常用候选地区；HK 可保留为地区限制对照组。OpenAI 当前支持地区应以其[官方列表](https://help.openai.com/en/articles/7947663-chatgpt-supported-countries)为准。
 
 如果本次目的只是尽快判断哪些节点能访问 ChatGPT，可使用：
 
@@ -139,13 +139,15 @@ ChatGPT 基础检测通过 `curl_cffi` 使用 Chrome TLS/JA3/HTTP2 指纹，并�
 
 目前没有找到并通过当前登录会话验证的、可长期依赖的 ChatGPT 网页 WebSocket 接口。因此第二阶段回退到 OpenAI 官方公开的 `wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1`。这是 Realtime API，不是 ChatGPT 网页内部接口，报告会明确标注这一点，不能用它单独断言 ChatGPT 网页聊天稳定。
 
-握手拿到 HTTP 101 后，程序仍会保持连接并定期发送 Ping。连接达到 `websocket_hold_seconds` 才算稳定；提前收到 Close、TLS/网络断开或帧错误会累计一次异常断开。发生断开时，每次重连都会重新连接同一官方端点。报告状态含义如下：
+握手拿到 HTTP 101 后，程序还会等待 Realtime API 的 `session.created` 事件，保持连接并校验 Ping/Pong。只有会话已建立、Ping 有响应且连接达到 `websocket_hold_seconds` 才算稳定。发生失败时，每次重连都会重新连接同一官方端点。报告状态含义如下：
 
 - `api-auth-boundary`：未配置 API key，端点返回 101 或 401/403；只证明 CONNECT、TLS 和官方协议入口可达，不计异常断开，也不进入稳定率分母。
 - `handshake-failed`：连接官方端点或 WebSocket Upgrade 失败，持续时长为 0。
-- `stable`：首次握手成功，且同一连接连续保持到配置阈值。
-- `stable-after-reconnect`：首次连接提前断开，但重新注册并连接后保持到阈值。
+- `stable`：首次会话建立成功，Ping/Pong 正常，且同一连接连续保持到配置阈值。
+- `stable-after-reconnect`：首次尝试失败，但重连后的会话通过了全部稳定性条件。
 - `unstable-disconnected`：握手曾成功，但在所有允许尝试中都提前异常断开。
+- `unstable-unresponsive`：连接未立即断开，但 Ping 在时限内没有收到对应 Pong，可能是半开连接或中间网络卡死。
+- `session-failed`：已升级 WebSocket，但没有收到 `session.created`，或收到服务端 `error`/非法协议数据。
 
 `chatgpt_websocket` 保留初次握手或认证边界结果，`chatgpt_websocket_seconds` 是所有尝试中最长的一次连续存活时长，不会把多次短连接相加；`chatgpt_websocket_disconnects` 是异常断开次数，`chatgpt_websocket_reconnect` 记录是否恢复。单次 101 绝不等同于稳定可用。
 

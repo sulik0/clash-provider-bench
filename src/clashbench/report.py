@@ -103,7 +103,10 @@ def websocket_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict
             "evaluated": evaluated, "boundary_only": boundary_only,
             "handshake_ok": sum(_row_get(row, "chatgpt_websocket") == "upgrade-101" for row in items),
             "stable": states["stable"], "recovered": states["stable-after-reconnect"],
-            "unstable": states["unstable-disconnected"], "handshake_failed": states["handshake-failed"],
+            "unstable": states["unstable-disconnected"],
+            "unresponsive": states["unstable-unresponsive"],
+            "session_failed": states["session-failed"],
+            "handshake_failed": states["handshake-failed"],
             "disconnects": disconnects, "duration_p50": percentile(durations, .5),
             "stable_rate": stable / evaluated * 100 if evaluated else None,
         })
@@ -112,19 +115,20 @@ def websocket_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict
 
 def _websocket_summary_table(items: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| 地区 | Provider | 候选 | 有效稳定性测试 | 仅认证边界 | 握手成功 | 首次稳定 | 重连恢复 | 不稳定断开 | 握手失败 | 异常断开次数 | 最长连续时长 P50 | 最终稳定率 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 地区 | Provider | 候选 | 有效稳定性测试 | 仅认证边界 | 握手成功 | 首次稳定 | 重连恢复 | 不稳定断开 | 无响应 | 会话失败 | 握手失败 | 异常断开次数 | 最长连续时长 P50 | 最终稳定率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in items:
         lines.append(
             f"| {_cell(row['region'])} | {_cell(row['provider'])} | {row['candidates']} | "
             f"{row['evaluated']} | {row['boundary_only']} | {row['handshake_ok']} | "
-            f"{row['stable']} | {row['recovered']} | {row['unstable']} | "
-            f"{row['handshake_failed']} | {row['disconnects']} | {_f(row['duration_p50'], ' s')} | "
+            f"{row['stable']} | {row['recovered']} | {row['unstable']} | {row['unresponsive']} | "
+            f"{row['session_failed']} | {row['handshake_failed']} | {row['disconnects']} | "
+            f"{_f(row['duration_p50'], ' s')} | "
             f"{_f(row['stable_rate'], '%')} |"
         )
     if not items:
-        lines.append("| — | — | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | — | — |")
+        lines.append("| — | — | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | — | — |")
     return lines
 
 
@@ -371,11 +375,11 @@ def _conditions(run: sqlite3.Row) -> list[str]:
     chatgpt_probe = params.get("chatgpt_probe") or {}
     return [
         f"- 对比条件 ID：`{run['comparison_key'] or 'legacy:' + run['config_digest']}`",
-        f"- 引擎：{run['engine_version'] or run['engine']}；策略：{params.get('test_strategy', 'legacy-single-stage')}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
+        f"- 引擎：{run['engine_version'] or run['engine']}；策略：{params.get('test_strategy', 'legacy-single-stage')}；两阶段合并：{params.get('two_stage_merge_strategy') or '不适用/旧版'}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
         f"- 文件大小：单阶段下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；两阶段通过节点下载 {params.get('two_stage_download_size_mb', '—')} MB / 上传 {params.get('two_stage_upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
         f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；并行 worker：{params.get('enrichment_workers', 1)}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
         f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
-        f"- WebSocket 回退：OpenAI Realtime API `/v1/realtime`；模型 {chatgpt_probe.get('realtime_model', 'legacy-unknown')}；认证模式 {chatgpt_probe.get('websocket_auth_mode', 'legacy-unknown')}；目标保持 {chatgpt_probe.get('websocket_hold_seconds', '—')} 秒；异常断开后最多重连 {chatgpt_probe.get('websocket_reconnect_attempts', '—')} 次",
+        f"- WebSocket 回退：OpenAI Realtime API `/v1/realtime`；模型 {chatgpt_probe.get('realtime_model', 'legacy-unknown')}；验证 {chatgpt_probe.get('websocket_validation', 'legacy-hold-only')}；认证模式 {chatgpt_probe.get('websocket_auth_mode', 'legacy-unknown')}；目标保持 {chatgpt_probe.get('websocket_hold_seconds', '—')} 秒；失败后最多重连 {chatgpt_probe.get('websocket_reconnect_attempts', '—')} 次",
         f"- 评测时区：{params.get('evaluation_timezone', 'Asia/Shanghai')}（数据库原始时间仍保存为 UTC）",
         f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
         f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
@@ -453,7 +457,7 @@ def _methodology() -> list[str]:
         "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
         "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
         "- ChatGPT 基础可用率的分母是实际完成第一阶段检查的样本，只把页面/后端、认证域名和静态资源均可达的 `available` 计为可用。它不包含 WebSocket 稳定性，也不使用或验证你的 ChatGPT 账号。",
-        "- 两阶段候选节点使用官方 OpenAI Realtime API `/v1/realtime` 作为 WebSocket 回退探测，它不代表 ChatGPT 网页内部传输。未配置 `OPENAI_API_KEY` 时，101 或 401/403 都只记为 `api-auth-boundary`，证明 CONNECT、TLS 和协议入口可达，不计连接时长、异常断开，也不混入有效稳定性样本；配置 API key 后，101 握手成功才会定期发送 Ping 并保持配置时长。提前关闭或网络异常记为异常断开，重连使用同一官方端点重新建立。时长字段记录各次连接中最长的一次连续存活时间，不把多次连接相加。`stable` 表示首次连接保持到阈值，`stable-after-reconnect` 表示断开后重连恢复，`unstable-disconnected` 和 `handshake-failed` 均不算稳定。",
+        "- 两阶段候选节点使用官方 OpenAI Realtime API `/v1/realtime` 作为 WebSocket 回退探测，它不代表 ChatGPT 网页内部传输。未配置 `OPENAI_API_KEY` 时，101 或 401/403 都只记为 `api-auth-boundary`，证明 CONNECT、TLS 和协议入口可达，不计连接时长、异常断开，也不混入有效稳定性样本；配置 API key 后，101 握手后还必须收到 `session.created`，并成功完成 Ping/Pong，才能记为稳定。提前关闭记为 `unstable-disconnected`，Ping 无响应记为 `unstable-unresponsive`，服务端错误、未建立会话或协议错误记为 `session-failed`。重连使用同一官方端点重新建立。时长字段记录各次连接中最长的一次连续存活时间，不把多次连接相加。",
     ]
 
 

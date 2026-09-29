@@ -83,10 +83,9 @@ def merge_two_stage(first_stage: list[Measurement], second_stage: list[Measureme
             item.download_mbps = None
             item.upload_mbps = None
             continue
-        item.available = measured.available
-        item.ttfb_ms = measured.ttfb_ms
-        item.jitter_ms = measured.jitter_ms
-        item.packet_loss_pct = measured.packet_loss_pct
+        # Keep stage-1 availability/latency/loss for every node. Replacing these
+        # fields only for candidates would mix two measurement conditions within
+        # one report and would count a throughput failure as an availability failure.
         item.download_mbps = measured.download_mbps
         item.upload_mbps = measured.upload_mbps
         item.status = measured.status
@@ -380,7 +379,7 @@ def cmd_doctor(args) -> int:
             "OK Realtime API credential: "
             + (
                 "configured (stability test enabled)"
-                if os.environ.get(api_key_env)
+                if os.environ.get(api_key_env, "").strip()
                 else "not configured (authentication-boundary probe only)"
             )
         )

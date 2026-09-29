@@ -49,6 +49,10 @@ def load_config(path: str | Path) -> Settings:
                                   user_agent=item.get("user_agent")))
     if not providers:
         raise ValueError("At least one [[providers]] entry is required")
+    provider_names = [provider.name for provider in providers]
+    duplicates = sorted({name for name in provider_names if provider_names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Provider names must be unique: {', '.join(duplicates)}")
     engine = dict(raw.get("engine", {}))
     speed_mode = str(engine.get("speed_mode", "full"))
     if speed_mode not in {"fast", "download", "full"}:
