@@ -383,7 +383,7 @@ websocket_hold_seconds = 2
             self.assertNotIn("999.0", trend_report(conn, run_partial, 7))
             report = current_report(conn, run_partial)
             self.assertIn("状态：**partial**", report)
-            self.assertIn("仅认证边界", report)
+            self.assertIn("仅检查服务器响应", report)
             self.assertIn("`api-auth-boundary`", report)
             conn.close()
 

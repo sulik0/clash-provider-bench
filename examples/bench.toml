@@ -4,14 +4,14 @@ regions = ["JP", "HK", "SG", "US"]
 [[providers]]
 name = "taishan"
 source_env = "TAISHAN_SUB_URL"
-# Some providers return a Base64 URI list to Mihomo's UA but native YAML here.
+# 有些服务商会根据 User-Agent 返回不同格式；clash.meta 通常能拿到 YAML。
 user_agent = "clash.meta"
 
 [[providers]]
 name = "cokecloud"
 source_env = "COKECLOUD_SUB_URL"
 
-# Local YAML is also supported; use exactly one of path/source_env per provider.
+# 也可以读取本地 YAML。每家服务商的 path 和 source_env 只填写一个。
 # [[providers]]
 # name = "local-snapshot"
 # path = "./private/local.yaml"
@@ -20,13 +20,12 @@ source_env = "COKECLOUD_SUB_URL"
 adapter = "faceair"
 binary = "../tools/bin/clash-speedtest"
 speed_mode = "download"
-# ChatGPT-first screening only needs a small, repeatable transfer; 5 MB avoids
-# multiplying traffic too aggressively across every node.
+# 普通 run 测试每个节点时下载 5 MB；--quick 和两阶段的第一阶段不测下载。
 server_url = "https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg"
 download_size_mb = 5
 upload_size_mb = 10
-# `--two-stage` uses these larger transfers only for nodes that pass all
-# ChatGPT checks in stage 1.
+# --two-stage 只对通过 ChatGPT 基础检查的节点使用下面的下载/上传量。
+# download 模式只测下载，full 模式才会加测上传。
 two_stage_download_size_mb = 50
 two_stage_upload_size_mb = 20
 timeout_seconds = 15
@@ -36,26 +35,24 @@ progress_interval_seconds = 5
 user_agent = "clash.meta"
 
 [enrichment]
-# Starts a separate, isolated Mihomo process for each provider and selects every
-# node through the official REST API. Enable for egress IP/country/ASN.
+# 另行启动 Mihomo，逐个切换节点，查询出口 IP、国家和 ASN。
 enabled = true
 mihomo_binary = "../tools/bin/mihomo"
 timeout_seconds = 15
-# Each worker owns a separate Mihomo process, so selectors and proxy sessions do
-# not leak across nodes. Four workers make the HTTP-only enrichment phase much faster.
+# 4 个 worker 同时检查节点，各自使用独立的 Mihomo，切换节点时不会互相影响。
 workers = 4
-# Two-stage mode tests the documented OpenAI Realtime API WebSocket fallback.
-# With OPENAI_API_KEY it holds the connection for 15 seconds; without a key it
-# only verifies that the selected node reaches the API authentication boundary.
+# 两阶段模式会连接 OpenAI Realtime API，检查 WebSocket。
+# 填写 OPENAI_API_KEY 后，程序会确认会话已建立、Ping 收到 Pong，并保持 15 秒。
+# 没有 key 时，只检查服务器是否响应，不计算连接稳定率。
 websocket_hold_seconds = 15
 websocket_reconnect_attempts = 1
 openai_api_key_env = "OPENAI_API_KEY"
 realtime_model = "gpt-realtime-2.1"
-# ChatGPT is the primary goal. Skip YouTube/Netflix to reduce per-node runtime.
+# 这里只检查 ChatGPT。需要时可以添加 youtube、netflix，但每个节点会多花一些时间。
 unlock = true
 checks = ["chatgpt"]
-# Current OpenAI availability policy does not list these nearby exit regions.
-# The actual exit country (not the node name) is checked against this list.
+# 实际出口国家在这个列表中时，程序将 ChatGPT 结果记为地区不支持。
+# 可根据 OpenAI 官方支持地区列表调整；程序使用出口查询结果，不靠节点名判断。
 chatgpt_unsupported_countries = ["CN", "HK", "MO"]
 
 [report]
@@ -64,10 +61,10 @@ days = 7
 timezone = "Asia/Shanghai"
 
 [notification]
-# Send a native macOS notification after every scheduled or manual real run.
+# 每次实际测试结束后发送 macOS 通知，手动运行和定时运行都会发送。
 enabled = true
 mode = "macos"
 
-# Override/add classification rules if your provider uses unusual names.
+# 如果节点名没有被正确归类，可以在这里添加或替换地区识别规则。
 # [region_patterns]
 # JP = ["(?i)日本|东京|JP"]

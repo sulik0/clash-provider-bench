@@ -65,7 +65,7 @@ def chatgpt_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict[s
 
 def _chatgpt_summary_table(items: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| 地区 | Provider | 总样本 | 已检测 | 可用 | 地区不支持 | Cloudflare 挑战 | 阻断 | 其他失败 | ChatGPT 可用率 |",
+        "| 地区 | 服务商 | 总记录数 | 已检查 | 通过检查 | 地区不支持 | Cloudflare 要求验证 | 请求被拒绝 | 其他失败 | ChatGPT 基础检查通过率 |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in items:
@@ -115,7 +115,7 @@ def websocket_summary(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[dict
 
 def _websocket_summary_table(items: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| 地区 | Provider | 候选 | 有效稳定性测试 | 仅认证边界 | 握手成功 | 首次稳定 | 重连恢复 | 不稳定断开 | 无响应 | 会话失败 | 握手失败 | 异常断开次数 | 最长连续时长 P50 | 最终稳定率 |",
+        "| 地区 | 服务商 | 已检查的候选节点 | 参与稳定率统计 | 仅检查服务器响应 | 握手成功 | 首次连接稳定 | 重连后稳定 | 提前断开 | Ping 未收到回复 | 会话失败 | 握手失败 | 提前断开次数 | 最长持续连接 P50 | 最终稳定率 |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in items:
@@ -134,7 +134,7 @@ def _websocket_summary_table(items: list[dict[str, Any]]) -> list[str]:
 
 def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[str]:
     lines = [
-        "| Provider | 地区 | 节点 | 协议 | ChatGPT 基础结果 | 认证域名 | 静态资源 | WS 握手 | 最长连续时长 | 异常断开 | 重连 | WS 稳定性 | 大流量测速 | 出口国家 | ASN |",
+        "| 服务商 | 地区 | 节点 | 协议 | ChatGPT 基础检查 | 登录服务 | 静态资源服务器 | WebSocket 握手 | 最长持续连接 | 提前断开次数 | 重连结果 | 连接是否稳定 | 下载/上传测试 | 出口国家 | ASN |",
         "|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---|",
     ]
     found = False
@@ -155,7 +155,7 @@ def _chatgpt_node_table(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> list[st
             f"{_cell(row['exit_country'])} | {_cell(row['asn'])} |"
         )
     if not found:
-        lines.append("| — | — | — | — | 未启用或没有完成检测 | — | — | — | — | — | — | — | — | — | — |")
+        lines.append("| — | — | — | — | 未开启检查，或没有完成检查的记录 | — | — | — | — | — | — | — | — | — | — |")
     return lines
 
 
@@ -326,8 +326,8 @@ def build_summary(
 def _summary_table(summary: list[dict[str, Any]], dimensions: tuple[str, ...]) -> list[str]:
     labels = {"provider": "供应商", "region": "地区", "proxy_type": "协议"}
     headers = [labels[name] for name in dimensions] + [
-        "总样本", "可用节点", "吞吐尝试", "吞吐成功/失败", "可用率", "吞吐成功率", "吞吐失败率", "TTFB P50/P95 (n)", "抖动 P50 (n)", "丢包 P50 (n)",
-        "下载 P50/P95 (n)", "上传 P50 (n)", "下载 CV (n)", "晚高峰衰减 (晚/日 n)",
+        "总记录数", "节点可用记录数", "下载/上传尝试数", "下载/上传成功数/失败数", "节点可用率", "下载/上传成功率", "下载/上传失败率", "TTFB P50/P95 (n)", "抖动 P50 (n)", "丢包 P50 (n)",
+        "下载 P50/P95 (n)", "上传 P50 (n)", "下载速度 CV (n)", "晚高峰速度下降 (晚间/白天 n)",
     ]
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(dimensions) + ["---:"] * 14) + "|"]
     for row in summary:
@@ -351,7 +351,7 @@ def _summary_table(summary: list[dict[str, Any]], dimensions: tuple[str, ...]) -
 
 def _infra_table(items: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| 地区 | 供应商 | 节点 | 出口覆盖 | 独立出口 | 独立 ASN | 独立组织 | 最大出口集中度 | 最大 ASN 集中度 | enrichment 异常 |",
+        "| 地区 | 供应商 | 节点数 | 查到出口 IP 的比例 | 不同出口 IP 数 | 不同 ASN 数 | 不同组织数 | 最常用出口 IP 占比 | 最常用 ASN 占比 | 额外检查出错记录数 |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in items:
@@ -375,14 +375,15 @@ def _conditions(run: sqlite3.Row) -> list[str]:
     chatgpt_probe = params.get("chatgpt_probe") or {}
     return [
         f"- 对比条件 ID：`{run['comparison_key'] or 'legacy:' + run['config_digest']}`",
-        f"- 引擎：{run['engine_version'] or run['engine']}；策略：{params.get('test_strategy', 'legacy-single-stage')}；两阶段合并：{params.get('two_stage_merge_strategy') or '不适用/旧版'}；模式：{params.get('speed_mode', 'legacy-unknown')}；端点：{params.get('server_url', 'legacy-unknown')}",
-        f"- 文件大小：单阶段下载 {params.get('download_size_mb', '—')} MB / 上传 {params.get('upload_size_mb', '—')} MB；两阶段通过节点下载 {params.get('two_stage_download_size_mb', '—')} MB / 上传 {params.get('two_stage_upload_size_mb', '—')} MB；并发 {params.get('concurrent', '—')}；超时 {params.get('timeout_seconds', '—')} 秒",
-        f"- 附加检测：{','.join(checks) if checks else '未启用专项可用性检测'}；并行 worker：{params.get('enrichment_workers', 1)}；ChatGPT 配置排除地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}",
-        f"- ChatGPT 探测客户端：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；指纹：{chatgpt_probe.get('impersonate', 'legacy-unknown')}",
-        f"- WebSocket 回退：OpenAI Realtime API `/v1/realtime`；模型 {chatgpt_probe.get('realtime_model', 'legacy-unknown')}；验证 {chatgpt_probe.get('websocket_validation', 'legacy-hold-only')}；认证模式 {chatgpt_probe.get('websocket_auth_mode', 'legacy-unknown')}；目标保持 {chatgpt_probe.get('websocket_hold_seconds', '—')} 秒；失败后最多重连 {chatgpt_probe.get('websocket_reconnect_attempts', '—')} 次",
+        f"- 测速工具：{run['engine_version'] or run['engine']}；运行方式：{params.get('test_strategy', 'legacy-single-stage')}；测速模式：{params.get('speed_mode', 'legacy-unknown')}；测速地址：{params.get('server_url', 'legacy-unknown')}",
+        f"- 每个节点的测试数据量：普通模式下载 {params.get('download_size_mb', '—')} MB、上传 {params.get('upload_size_mb', '—')} MB；两阶段模式中，通过 ChatGPT 检查后下载 {params.get('two_stage_download_size_mb', '—')} MB、上传 {params.get('two_stage_upload_size_mb', '—')} MB。实际测下载还是上传，由测速模式决定。下载并发数为 {params.get('concurrent', '—')}，超时时间为 {params.get('timeout_seconds', '—')} 秒。",
+        f"- 两阶段记录的合并方式（版本）：{params.get('two_stage_merge_strategy') or '本次不适用，或旧记录未保存'}。当前实现保留第一阶段的基础网络结果，再补上第二阶段的下载和上传结果。",
+        f"- 检查的服务：{','.join(checks) if checks else '未开启服务检查'}；同时检查节点的 worker 数：{params.get('enrichment_workers', 1)}；配置中标记为不支持 ChatGPT 的地区：{','.join(params.get('chatgpt_unsupported_countries', [])) or '无'}。",
+        f"- ChatGPT 请求使用：{chatgpt_probe.get('client', 'legacy-unknown')} {chatgpt_probe.get('version', '')}；模拟浏览器的请求特征：{chatgpt_probe.get('impersonate', 'legacy-unknown')}。",
+        f"- WebSocket 检查使用 OpenAI Realtime API `/v1/realtime`。模型为 {chatgpt_probe.get('realtime_model', 'legacy-unknown')}，验证方法为 {chatgpt_probe.get('websocket_validation', 'legacy-hold-only')}，认证方式为 {chatgpt_probe.get('websocket_auth_mode', 'legacy-unknown')}。要求连接保持 {chatgpt_probe.get('websocket_hold_seconds', '—')} 秒，检查失败后最多重连 {chatgpt_probe.get('websocket_reconnect_attempts', '—')} 次。",
         f"- 评测时区：{params.get('evaluation_timezone', 'Asia/Shanghai')}（数据库原始时间仍保存为 UTC）",
-        f"- 默认接口：{env.get('default_interface') or '未知'}；系统代理：{','.join(enabled) if enabled else '未检测到启用'}；活动 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}",
-        f"- Provider 顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧数据未记录'}",
+        f"- 默认网络接口：{env.get('default_interface') or '未知'}；启用的系统代理：{','.join(enabled) if enabled else '未检测到启用'}；正在使用的 TUN/VPN 接口：{','.join(env.get('tunnel_interfaces_active', [])) or '未检测到'}。",
+        f"- 服务商测试顺序：{' → '.join(_json(run['provider_order_json'], [])) or '旧记录未保存'}。",
     ]
 
 
@@ -395,23 +396,23 @@ def current_report(conn: sqlite3.Connection, run_id: str, timezone_name: str = "
     protocol = summarize_rows(rows, ("provider", "region", "proxy_type"), timezone_name)
     anomalies = find_anomalies(regional)
     out = ["# Clash/Mihomo 单次评测报告", "", f"运行：`{run_id}`；开始：{started_at}（{timezone_name}）；状态：**{run['status']}**。", "",
-           "## 本次测试条件", "", *_conditions(run), "", "## Provider 执行状态", "",
-           "| 顺序 | Provider | 状态 | 测量数 | 错误 |", "|---:|---|---|---:|---|"]
+           "## 本次测试条件", "", *_conditions(run), "", "## 各家服务商是否完成测试", "",
+           "| 顺序 | 服务商 | 状态 | 测量记录数 | 错误 |", "|---:|---|---|---:|---|"]
     if provider_runs:
         for item in provider_runs:
             out.append(f"| {item['ordinal'] + 1} | {item['provider']} | {item['status']} | {item['measurement_count']} | {item['error'] or '—'} |")
     else:
         out.append("| — | 旧数据未记录 | — | — | — |")
-    out += ["", "## 本次：Provider × 地区", "", *_summary_table(regional, ("provider", "region")),
-            "", "## 本次：Provider × 地区 × 协议", "", *_summary_table(protocol, ("provider", "region", "proxy_type")),
-            "", "## 本次 ChatGPT 可用性", "", *_chatgpt_summary_table(chatgpt_summary(rows)),
-            "", "> `available` 只表示第一阶段的 ChatGPT 页面/后端、认证域名和静态资源基础路径可达。第二阶段 WebSocket 使用官方 Realtime API 回退，不代表 ChatGPT 网页内部连接；单次 `upgrade-101` 也不等同于稳定可用。", "",
-            "## 本次 Realtime API WebSocket", "", *_websocket_summary_table(websocket_summary(rows)), "",
+    out += ["", "## 按服务商和地区比较本次结果", "", *_summary_table(regional, ("provider", "region")),
+            "", "## 按服务商、地区和协议比较本次结果", "", *_summary_table(protocol, ("provider", "region", "proxy_type")),
+            "", "## 哪些节点通过了 ChatGPT 基础检查", "", *_chatgpt_summary_table(chatgpt_summary(rows)),
+            "", "> `available` 表示 ChatGPT 首页、后端、登录服务和静态资源服务器通过基础检查。第二阶段连接的是 Realtime API。看到 `upgrade-101` 时，还要查看会话是否建立、连接是否保持；实际聊天和账号权限需要在 ChatGPT 中验证。", "",
+            "## 本次 Realtime API WebSocket 连接结果", "", *_websocket_summary_table(websocket_summary(rows)), "",
             *_chatgpt_node_table(rows),
-            "", "## 本次基础设施多样性", "", *_infra_table(infrastructure_summary(rows)), "", "## 本次异常", ""]
+            "", "## 本次查到了多少不同的出口和网络", "", *_infra_table(infrastructure_summary(rows)), "", "## 需要留意的测速结果", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
     enrichment_failures = sum(1 for row in rows if row["enrichment_status"] in ("failed", "partial"))
-    out += ["", f"> 附加信息异常 {enrichment_failures} 条；它们不会计入节点测速失败，也不会改变成功率。", "", *_methodology()]
+    out += ["", f"> 有 {enrichment_failures} 条记录在查询出口或检查服务、WebSocket 时出错。已取得的测速结果仍然保留，这些额外检查错误不计入下载/上传失败率。", "", *_methodology()]
     return "\n".join(out) + "\n"
 
 
@@ -432,15 +433,15 @@ def trend_report(
         (since_iso(days),),
     ).fetchall()
     out = [f"# Clash/Mihomo 最近 {days} 天趋势报告", "", f"生成时间：{datetime.now(timezone).isoformat(timespec='seconds')}（{timezone_name}）。", "",
-           f"> 本报告只统计与锚点运行 `{run_id}` 对比条件完全一致且状态为 ok 的运行：{run_count} 次；另有 {excluded} 次因条件不同、旧格式、partial 或 failed 未混入统计。", "",
-           "## 对比条件", "", *_conditions(anchor), "", "## Provider × 地区趋势", "",
-           *_summary_table(regional, ("provider", "region")), "", "## Provider × 地区 × 协议趋势", "",
-           *_summary_table(protocol, ("provider", "region", "proxy_type")), "", "## ChatGPT 可用性趋势", "",
-           *_chatgpt_summary_table(chatgpt_summary(rows)), "", "## Realtime API WebSocket 趋势", "",
-           *_websocket_summary_table(websocket_summary(rows)), "", "## 基础设施多样性（每节点取窗口内最新观测）", "",
-           *_infra_table(infrastructure_summary(rows)), "", "## 异常", ""]
+           f"> 本报告以运行 `{run_id}` 的测试条件选择历史数据，共统计 {run_count} 次条件相同、状态为 `ok` 的运行。另有 {excluded} 次运行没有参加统计：它们的条件不同、属于其他旧数据分组，或者状态为 `partial`（部分完成）或 `failed`（失败）。", "",
+           "## 这些运行使用的测试条件", "", *_conditions(anchor), "", "## 按服务商和地区比较趋势", "",
+           *_summary_table(regional, ("provider", "region")), "", "## 按服务商、地区和协议比较趋势", "",
+           *_summary_table(protocol, ("provider", "region", "proxy_type")), "", "## ChatGPT 基础检查结果随时间的变化", "",
+           *_chatgpt_summary_table(chatgpt_summary(rows)), "", "## Realtime API WebSocket 连接结果随时间的变化", "",
+           *_websocket_summary_table(websocket_summary(rows)), "", "## 查到了多少不同的出口和网络（每个节点取最近一条记录）", "",
+           *_infra_table(infrastructure_summary(rows)), "", "## 需要留意的测速结果", ""]
     out += [f"- {item['region']} / {item['provider']}：{item['reason']}" for item in anomalies] or ["未发现达到默认阈值的测速异常。"]
-    out += ["", "## 历史条件清单（各组不互相混合）", "", "| 条件 ID | 全部运行 | 完整运行 |", "|---|---:|---:|"]
+    out += ["", "## 历史记录使用过哪些测试条件（各组分别统计）", "", "| 条件 ID | 运行总次数 | 所有服务商完成测试的次数 |", "|---|---:|---:|"]
     for profile in profiles:
         out.append(f"| `{profile['profile']}` | {profile['runs']} | {profile['ok_runs']} |")
     out += ["", *_methodology()]
@@ -449,15 +450,19 @@ def trend_report(
 
 def _methodology() -> list[str]:
     return [
-        "## 统计口径", "",
-        "- 总样本是节点测量记录数。可用表示轻量延迟探测成功且丢包低于 100%；吞吐成功/失败率的分母只包含实际进入下载/上传阶段的记录。两阶段模式中，未通过 ChatGPT 检查的节点不会做大流量测速，也不会被误算为吞吐失败。旧数据没有阶段标记时按已尝试吞吐处理。",
-        "- 每个 P50/P95、CV 后的 `n` 是该指标实际使用的非空有效样本数。TTFB 和抖动使用轻量探测可用且对应数值存在的记录；下载和上传使用实际取得该吞吐数值的记录；丢包使用所有具有丢包数值的记录。",
-        "- 下载 CV = 下载速度总体标准差 / 均值，仅在至少 2 个下载有效样本时计算。CV 越低表示窗口内波动越小。",
-        "- 晚高峰按报告配置的评测时区计算，为 20:00–23:59；日间基准为 09:00 与 14:00。默认评测时区是 Asia/Shanghai，括号显示晚高峰/日间有效下载样本数；负衰减表示晚高峰反而更快。",
-        "- 趋势只纳入状态为 `ok` 且对比条件 ID 相同的运行。测速端点、模式、文件大小、并发、超时、地区、引擎版本或架构变化都会生成新的条件 ID。",
-        "- enrichment 失败只影响出口 IP/ASN 覆盖率，不改变节点测速状态、成功率或吞吐统计。基础设施集中度以不同节点的最新出口观测计算，避免定时重复测试放大某个出口。",
-        "- ChatGPT 基础可用率的分母是实际完成第一阶段检查的样本，只把页面/后端、认证域名和静态资源均可达的 `available` 计为可用。它不包含 WebSocket 稳定性，也不使用或验证你的 ChatGPT 账号。",
-        "- 两阶段候选节点使用官方 OpenAI Realtime API `/v1/realtime` 作为 WebSocket 回退探测，它不代表 ChatGPT 网页内部传输。未配置 `OPENAI_API_KEY` 时，101 或 401/403 都只记为 `api-auth-boundary`，证明 CONNECT、TLS 和协议入口可达，不计连接时长、异常断开，也不混入有效稳定性样本；配置 API key 后，101 握手后还必须收到 `session.created`，并成功完成 Ping/Pong，才能记为稳定。提前关闭记为 `unstable-disconnected`，Ping 无响应记为 `unstable-unresponsive`，服务端错误、未建立会话或协议错误记为 `session-failed`。重连使用同一官方端点重新建立。时长字段记录各次连接中最长的一次连续存活时间，不把多次连接相加。",
+        "## 报告里的数字怎么算", "",
+        "- 每测一个节点，记为一条记录。同一节点测多次，就有多条记录。延迟测试成功且丢包低于 100% 时，记为节点可用。两阶段模式使用第一阶段的基础网络结果。",
+        "- 下载/上传成功率和失败率只统计实际尝试测速的记录。其中 `status=ok` 且有下载速度的记录计为成功，其余已尝试记录计为失败。没有通过 ChatGPT 基础检查的节点会跳过下载和上传，不计入这个分母；旧记录没有保存是否尝试的标记，按已经尝试处理。",
+        "- P50 是中位数，P95 表示 95% 的样本不超过这个值。每个指标后的 `n` 是计算时用了多少条记录。TTFB（等待首个响应字节的时间）、抖动、下载和上传只使用节点可用且对应数值存在的记录；丢包使用所有带有丢包数值的记录。",
+        "- 下载速度 CV（变异系数）= 总体标准差 / 平均值 × 100%。至少有 2 条下载记录才计算。数值越低说明这组速度越接近；分组可能包含不同节点，因此不能单凭它判断某一个节点是否稳定。",
+        "- 晚高峰为报告时区中的 20:00–23:59，白天的比较数据取 09:00–09:59 和 14:00–14:59，默认使用北京时间 Asia/Shanghai。程序比较两个时段的下载中位数，括号显示晚间和白天各用了多少条记录。下降比例为负时，表示晚间反而更快。",
+        "- 趋势只统计对比条件 ID 相同、运行状态为 `ok` 的记录。这里的 `ok` 表示各家服务商都完成测试，其中仍可能有失败节点。测速地址、模式、文件大小、并发、超时、地区、工具版本、验证方法或机器架构改变后，会生成新的条件 ID。",
+        "- 查询出口或检查服务、WebSocket 时出错，不会改变已经取得的测速结果。共用出口和 ASN 的比例按每个节点最近一条记录计算，避免重复测试同一节点时重复计数。",
+        "- ChatGPT 基础检查通过率 = 结果为 `available` 的记录数 / 有 ChatGPT 检查结果的记录数。程序检查首页、后端、登录服务和静态资源服务器，不读取你的 ChatGPT 账号或浏览器 Cookie。WebSocket 结果另行统计。",
+        "- 两阶段模式会连接 OpenAI Realtime API `/v1/realtime`，检查 WebSocket。没有配置 `OPENAI_API_KEY` 时，101 或 401/403 只记为 `api-auth-boundary`，说明服务器已经响应；程序没有测试持续连接，因此不计入稳定率，也不记录持续时长和提前断开次数。",
+        "- 配置 API key 后，程序要求握手成功、收到 `session.created`、发送 Ping 后收到对应的 Pong，而且连接保持到设定时间。第一次就通过检查记为 `stable`，重连后通过记为 `stable-after-reconnect`；最终稳定率包含这两种结果，报告也会分别显示数量。",
+        "- 连接提前关闭记为 `unstable-disconnected`，Ping 迟迟没有收到回复记为 `unstable-unresponsive`。服务器返回错误、会话没有建立或协议数据无法解析时，记为 `session-failed`。重连会再次连接同一地址，持续时长取各次尝试中最长的一次，不把短连接相加。",
+        "- Realtime API 的结果说明节点与该 API 之间的连接情况。ChatGPT 网页使用的接口、账号权限和实际聊天请求仍需要在 ChatGPT 中验证。",
     ]
 
 
